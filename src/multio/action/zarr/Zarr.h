@@ -1,0 +1,65 @@
+/*
+ * (C) Copyright 2026- ECMWF.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/// Action `zarr`: writes aggregated grid-point fields with FA-style metadata into zarr v3 stores,
+/// one store per domain (<path>/<domain>.zarr).
+///
+/// Plan configuration:
+///
+///   - type: zarr
+///     path: <output dir>              # required, {ENV} substitution as elsewhere in multio
+///     format: 3                       # only zarr v3 is supported
+///     layout: chunk-per-level         # (default) or shard-levels
+///     coordinates-from: <dir>         # optional: copy static arrays and root attributes from <dir>/<domain>.zarr
+///     timestep: <seconds>             # optional fallback if fields carry no `timestep`
+///
+/// It is a terminal action (a sink): it needs the metadata of the message, which plain DataSinks do not get.
+
+#pragma once
+
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "multio/action/Action.h"
+#include "multio/action/zarr/ZarrStore.h"
+
+namespace multio::action::zarr {
+
+using message::Message;
+
+class Zarr final : public Action {
+public:
+    explicit Zarr(const ComponentConfiguration& compConf);
+    ~Zarr() override;
+
+private:
+    void executeImpl(Message msg) override;
+    void print(std::ostream& os) const override;
+
+    void field(const Message& msg);
+    void flush(const Message& msg);
+
+    ZarrStore& store(const std::string& domain, const Message& msg);
+    void finalizeAll() noexcept;
+
+    std::string path_;
+    int format_;
+    Layout layout_;
+    std::optional<std::string> coordinatesFrom_;
+    std::optional<double> timestep_;
+
+    std::map<std::string, std::unique_ptr<ZarrStore>> stores_;
+    std::vector<float> buffer_;
+};
+
+}  // namespace multio::action::zarr

@@ -24,6 +24,7 @@ list( APPEND multio_action_plugins
     multio-action-scale
     multio-action-average-rate
     multio-action-encode-mtg2
+    multio-action-zarr
 )
 
 if( HAVE_MIR )
