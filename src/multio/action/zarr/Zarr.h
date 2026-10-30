@@ -21,6 +21,11 @@
 ///     timestep: <seconds>             # optional fallback if fields carry no `timestep`
 ///
 /// It is a terminal action (a sink): it needs the metadata of the message, which plain DataSinks do not get.
+///
+/// Field payload: the global field (after aggregate) as nx*ny values (geometry-nx, geometry-ny), or, when the
+/// field carries geometry-nx-full, geometry-ny-full, geometry-x0, geometry-y0, the full nx_full*ny_full grid
+/// (C order, index (j-1)*nx_full+(i-1)) of which only the nx x ny window at the 1-based offset (x0, y0) is
+/// written (IAL FullPos: the C+I zone of the C+I+E grid).
 
 #pragma once
 

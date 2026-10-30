@@ -476,8 +476,17 @@ void ZarrStore::flush(std::optional<std::int64_t> step, std::optional<double> le
                                      << std::endl;
             return;
         }
-        OpenStep& st = openStep(*step);
-        closeStep(st, leadTime);
+        auto it = stepTime_.find(*step);
+        if (it == stepTime_.end()) {
+            // No field of this store arrived for this step (e.g. the FullPos domain had no output at this step,
+            // or the flush comes from a domain-wide step notification): no time step is created. The step counts
+            // as flushed, so a late field for it is reported as such.
+            eckit::Log::info() << "zarr action: " << name_ << ": flush for step " << *step
+                               << " without fields, no time step written" << std::endl;
+            closed_.insert(*step);
+            return;
+        }
+        closeStep(open_.at(it->second), leadTime);
         return;
     }
     bool single = open_.size() == 1;

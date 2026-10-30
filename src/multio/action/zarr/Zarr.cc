@@ -10,9 +10,12 @@
 
 #include "Zarr.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <iostream>
+#include <iterator>
+#include <sstream>
 #include <type_traits>
 
 #include "eckit/exception/Exceptions.h"
@@ -206,6 +209,47 @@ void normaliseName(std::string& prefix, std::string& suffix, std::int64_t& level
     }
 }
 
+/// Split an FA article name into (prefix, suffix, level) the way the IO-server prototype receives it in
+/// IOFLDDESC, before normaliseName:
+///   KB / KT + level digits (FA writes them with 3 digits): KT273ISOT_ALTIT -> KT, ISOT_ALTIT, 273
+///   everything else: 4 character prefix + rest, as IOGRIDA_MOD and INI2WRFP do for 2-D fields
+///   (CLSTEMPERATURE -> CLST, EMPERATURE); a prefix with level digits (S090..., P85000..., H00500...,
+///   C002...) is reduced to its level type letter by normaliseName afterwards.
+/// A level found in the name is only used when `level` is 0 (ILEVG wins, as in IOZ_NORM_NAME).
+void splitFaName(const std::string& name, std::string& prefix, std::string& suffix, std::int64_t& level) {
+    if (name.size() > 2 && isKbKt(name.substr(0, 2)) && isDigit(name[2])) {
+        std::size_t e = 2;
+        while (e < name.size() && isDigit(name[e])) {
+            ++e;
+        }
+        if (e < name.size()) {
+            std::int64_t lev = 0;
+            try {
+                lev = std::stoll(name.substr(2, e - 2));
+            }
+            catch (...) {
+                lev = 0;
+            }
+            prefix = name.substr(0, 2);
+            suffix = trim(name.substr(e));
+            if (level == 0) {
+                level = lev;
+            }
+            return;
+        }
+    }
+    prefix = trim(name.substr(0, std::min<std::size_t>(4, name.size())));
+    suffix = name.size() > 4 ? trim(name.substr(4)) : std::string();
+}
+
+/// Crop window of a field whose payload is the full FullPos grid (C+I+E zones)
+struct Crop {
+    std::int64_t nxFull;
+    std::int64_t nyFull;
+    std::int64_t x0;  // 1-based
+    std::int64_t y0;  // 1-based
+};
+
 Layout parseLayout(const std::string& s) {
     if (s == "chunk-per-level") {
         return Layout::ChunkPerLevel;
@@ -311,22 +355,34 @@ void Zarr::field(const Message& msg) {
         throw eckit::UserError("zarr action: field without 'domain' (the store name)", Here());
     }
 
+    // Field identification. With `levtype` (IAL's CPREF, raw or already normalised), `suffix` (CSUFF) and
+    // `levelist` (ILEVG) the descriptor is normalised exactly as IOZ_NORM_NAME does it on the IO server.
+    // Without `levtype` the FA article name `name` is split as IOFLDDESC would carry it (splitFaName).
+    const std::string name = trim(mdString(md, "name").value_or(""));
+    const std::optional<std::int64_t> levelist = mdInt(md, "levelist") ? mdInt(md, "levelist") : mdInt(md, "level");
     FieldDescription fd;
-    if (auto lt = mdString(md, "levtype")) {
+    fd.level = levelist.value_or(0);
+    if (auto lt = mdString(md, "levtype"); lt && !trim(*lt).empty()) {
         fd.prefix = trim(*lt);
         fd.suffix = trim(mdString(md, "suffix").value_or(""));
+        normaliseName(fd.prefix, fd.suffix, fd.level);
+        if (!levelist && fd.level == 0 && !name.empty() && prefixIs3d(fd.prefix)) {
+            // a bare level type without `levelist`: take the level from the article name if it is the same field
+            FieldDescription fn;
+            splitFaName(name, fn.prefix, fn.suffix, fn.level);
+            normaliseName(fn.prefix, fn.suffix, fn.level);
+            if (fn.prefix == fd.prefix && fn.suffix == fd.suffix) {
+                fd.level = fn.level;
+            }
+        }
     }
     else {
-        // FA article name: 4 character prefix + suffix (normalised below)
-        std::string name = trim(mdString(md, "name").value_or(""));
         if (name.empty()) {
             throw eckit::UserError("zarr action: field without 'levtype'/'suffix' and without 'name'", Here());
         }
-        fd.prefix = trim(name.substr(0, std::min<std::size_t>(4, name.size())));
-        fd.suffix = name.size() > 4 ? trim(name.substr(4)) : std::string();
+        splitFaName(name, fd.prefix, fd.suffix, fd.level);
+        normaliseName(fd.prefix, fd.suffix, fd.level);
     }
-    fd.level = mdInt(md, "levelist").value_or(mdInt(md, "level").value_or(0));
-    normaliseName(fd.prefix, fd.suffix, fd.level);
     fd.is3d = mdBool(md, "is3d").value_or(prefixIs3d(fd.prefix));
     fd.gribCode = mdInt(md, "grib-code").value_or(0);
     fd.step = mdInt(md, "step").value_or(0);
@@ -337,24 +393,113 @@ void Zarr::field(const Message& msg) {
         fd.leadTime = static_cast<double>(fd.step) * *timestep_;
     }
 
+    // Field label for error messages
+    auto label = [&]() {
+        std::ostringstream oss;
+        oss << "field " << (name.empty() ? fd.prefix + "*" + fd.suffix : name) << " (level " << fd.level << ", step "
+            << fd.step << ") of domain " << *domain;
+        return oss.str();
+    };
+
+    // Geometry: the store grid is the nx x ny window (geometry-nx/-ny). With geometry-nx-full, geometry-ny-full,
+    // geometry-x0, geometry-y0 the payload is the full nx_full x ny_full grid (C order, x fastest, IAL's C+I+E
+    // zones) and only the window starting at the 1-based point (x0, y0) is written.
+    const auto gnx = mdInt(md, "geometry-nx");
+    const auto gny = mdInt(md, "geometry-ny");
+    const std::optional<std::int64_t> cropKeys[4] = {mdInt(md, "geometry-nx-full"), mdInt(md, "geometry-ny-full"),
+                                                     mdInt(md, "geometry-x0"), mdInt(md, "geometry-y0")};
+    const int ncrop = static_cast<int>(std::count_if(std::begin(cropKeys), std::end(cropKeys),
+                                                     [](const auto& k) { return k.has_value(); }));
+    std::optional<Crop> crop;
+    if (ncrop != 0) {
+        if (ncrop != 4) {
+            throw eckit::UserError("zarr action: " + label()
+                                       + " carries only some of geometry-nx-full, geometry-ny-full, geometry-x0, "
+                                         "geometry-y0 (a crop window needs all four)",
+                                   Here());
+        }
+        if (!gnx || !gny) {
+            throw eckit::UserError("zarr action: " + label()
+                                       + " has a crop window (geometry-nx-full ...) but no geometry-nx/geometry-ny",
+                                   Here());
+        }
+        crop = Crop{*cropKeys[0], *cropKeys[1], *cropKeys[2], *cropKeys[3]};
+        if (*gnx < 1 || *gny < 1 || crop->x0 < 1 || crop->y0 < 1 || crop->x0 - 1 + *gnx > crop->nxFull
+            || crop->y0 - 1 + *gny > crop->nyFull) {
+            std::ostringstream oss;
+            oss << "zarr action: " << label() << ": crop window " << *gnx << " x " << *gny << " at (" << crop->x0
+                << ", " << crop->y0 << ") (1-based) does not fit into the full grid " << crop->nxFull << " x "
+                << crop->nyFull;
+            throw eckit::UserError(oss.str(), Here());
+        }
+    }
+
     // Precision of the payload
+    const auto globalSize = mdInt(md, "misc-globalSize");
     util::PrecisionTag prec = util::PrecisionTag::Double;
     if (auto p = mdString(md, "misc-precision"); p) {
         prec = util::decodePrecisionTag(*p);
     }
-    else if (auto gs = mdInt(md, "misc-globalSize"); gs && *gs > 0
-                                                       && msg.payload().size()
-                                                              == static_cast<std::size_t>(*gs) * sizeof(float)) {
+    else if (globalSize && *globalSize > 0
+             && msg.payload().size() == static_cast<std::size_t>(*globalSize) * sizeof(float)) {
         prec = util::PrecisionTag::Float;
     }
 
     ZarrStore& st = store(*domain, msg);
+    if ((gnx && *gnx != st.nx()) || (gny && *gny != st.ny())) {
+        std::ostringstream oss;
+        oss << "zarr action: " << label() << " has geometry " << gnx.value_or(st.nx()) << " x "
+            << gny.value_or(st.ny()) << ", but store " << st.name() << " is " << st.nx() << " x " << st.ny();
+        throw eckit::UserError(oss.str(), Here());
+    }
+    const std::size_t nx = static_cast<std::size_t>(st.nx());
+    const std::size_t ny = static_cast<std::size_t>(st.ny());
 
     util::dispatchPrecisionTag(prec, [&](auto pt) {
         using Precision = typename decltype(pt)::type;
+        if (msg.payload().size() % sizeof(Precision) != 0) {
+            std::ostringstream oss;
+            oss << "zarr action: " << label() << ": payload of " << msg.payload().size()
+                << " bytes is not a multiple of " << sizeof(Precision) << " (misc-precision)";
+            throw eckit::UserError(oss.str(), Here());
+        }
         const std::size_t n = msg.payload().size() / sizeof(Precision);
+        if (globalSize && static_cast<std::size_t>(*globalSize) != n) {
+            std::ostringstream oss;
+            oss << "zarr action: " << label() << ": payload has " << n << " values but misc-globalSize is "
+                << *globalSize << " (is there an aggregate action before zarr?)";
+            throw eckit::UserError(oss.str(), Here());
+        }
+        const std::size_t expected = crop ? static_cast<std::size_t>(crop->nxFull * crop->nyFull) : nx * ny;
+        if (n != expected) {
+            std::ostringstream oss;
+            oss << "zarr action: " << label() << ": payload has " << n << " values, expected ";
+            if (crop) {
+                oss << "geometry-nx-full * geometry-ny-full = " << crop->nxFull << " * " << crop->nyFull;
+            }
+            else {
+                oss << "nx * ny = " << nx << " * " << ny
+                    << " (a payload larger than the output grid needs geometry-nx-full, geometry-ny-full, "
+                       "geometry-x0, geometry-y0)";
+            }
+            throw eckit::UserError(oss.str(), Here());
+        }
         const auto* in = static_cast<const Precision*>(msg.payload().data());
-        if constexpr (std::is_same_v<Precision, float>) {
+        if (crop) {
+            buffer_.resize(nx * ny);
+            const std::size_t nxFull = static_cast<std::size_t>(crop->nxFull);
+            const std::size_t i0 = static_cast<std::size_t>(crop->x0 - 1);
+            const std::size_t j0 = static_cast<std::size_t>(crop->y0 - 1);
+            for (std::size_t j = 0; j < ny; ++j) {
+                const Precision* row = in + (j0 + j) * nxFull + i0;
+                float* out = buffer_.data() + j * nx;
+                for (std::size_t i = 0; i < nx; ++i) {
+                    out[i] = static_cast<float>(row[i]);
+                }
+            }
+            st.addField(fd, buffer_.data(), nx * ny);
+        }
+        else if constexpr (std::is_same_v<Precision, float>) {
             st.addField(fd, in, n);
         }
         else {
@@ -392,11 +537,14 @@ void Zarr::flush(const Message& msg) {
         }
     }
 
+    // A flush for a step without fields in this store adds no time step (ZarrStore::flush); end-of-simulation
+    // then only finalises. close-connection (sent by every client on multio_close_connections, after
+    // end-of-simulation) finalises only what is not finalised yet.
     auto apply = [&](ZarrStore& s) {
         if (!closeOnly) {
             s.flush(step, lead);
         }
-        if (endOfSimulation || closeOnly) {
+        if (endOfSimulation || (closeOnly && !s.finalized())) {
             s.finalize();
         }
     };
@@ -405,6 +553,7 @@ void Zarr::flush(const Message& msg) {
     if (domain && !domain->empty() && *domain != "global") {
         auto it = stores_.find(*domain);
         if (it == stores_.end()) {
+            // no field of this domain so far: nothing to close, no store is created
             LOG_DEBUG_LIB(LibMultio) << "zarr action: flush for domain " << *domain << " without any field"
                                      << std::endl;
             return;

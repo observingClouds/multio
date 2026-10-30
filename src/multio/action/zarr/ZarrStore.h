@@ -70,7 +70,8 @@ public:
     void addField(const FieldDescription& fd, const float* values, std::size_t n);
 
     /// Close an output step. Without a step, all open steps are closed (in order of appearance).
-    /// A step that has already been closed is not closed again.
+    /// A step that has already been closed is not closed again; a step without any field creates no
+    /// time step (it only counts as flushed).
     void flush(std::optional<std::int64_t> step, std::optional<double> leadTime);
 
     /// Rewrite every array's zarr.json with the final time length and the consolidated metadata.
