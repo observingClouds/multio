@@ -71,6 +71,21 @@ std::string readFile(const std::string& path);
 
 bool pathExists(const std::string& path);
 
+/// True if `path` is a directory (following symbolic links)
+bool isDirectory(const std::string& path);
+
+/// True if `path` is a regular file (following symbolic links)
+bool isRegularFile(const std::string& path);
+
+/// Names of the entries of directory `path`, without "." and "..", in no particular order.
+/// Throws if the directory cannot be read.
+std::vector<std::string> listDirectory(const std::string& path);
+
+/// Regular files (following symbolic links) below directory `dir`, as '/'-separated paths relative
+/// to `dir`, in no particular order. Recurses into subdirectories but not into symbolic links to
+/// directories (as a C++17 recursive_directory_iterator with default options does).
+std::vector<std::string> listFilesRecursive(const std::string& dir);
+
 void renamePath(const std::string& from, const std::string& to);
 
 /// Remove a file, ignoring errors

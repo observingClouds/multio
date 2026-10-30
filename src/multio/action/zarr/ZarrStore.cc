@@ -14,7 +14,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <limits>
 #include <sstream>
 
@@ -24,8 +23,6 @@
 #include "multio/LibMultio.h"
 
 namespace multio::action::zarr {
-
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -272,9 +269,10 @@ void ZarrStore::copyStaticArrays(const std::string& src) {
         entries = jsonObjectMembers(jsonMember(cm, "metadata"));
     }
     else {
-        for (const auto& de : fs::directory_iterator(src)) {
-            if (de.is_directory() && fs::exists(de.path() / "zarr.json")) {
-                entries.emplace_back(de.path().filename().string(), readFile((de.path() / "zarr.json").string()));
+        for (const auto& name : listDirectory(src)) {
+            const std::string node = src + "/" + name;
+            if (isDirectory(node) && pathExists(node + "/zarr.json")) {
+                entries.emplace_back(name, readFile(node + "/zarr.json"));
             }
         }
         std::sort(entries.begin(), entries.end());
@@ -293,22 +291,19 @@ void ZarrStore::copyStaticArrays(const std::string& src) {
             continue;
         }
 
-        fs::path from = fs::path(src) / nm;
-        if (!fs::is_directory(from)) {
+        const std::string from = src + "/" + nm;
+        if (!isDirectory(from)) {
             continue;
         }
-        for (auto it = fs::recursive_directory_iterator(from); it != fs::recursive_directory_iterator(); ++it) {
-            if (!it->is_regular_file()) {
-                continue;
-            }
-            std::string fname = it->path().filename().string();
+        for (const auto& rel : listFilesRecursive(from)) {
+            const auto slash = rel.find_last_of('/');
+            const std::string fname = slash == std::string::npos ? rel : rel.substr(slash + 1);
             if (startsWith(fname, ".staging") || fname.find(".tmp") != std::string::npos) {
                 continue;
             }
-            fs::path rel = fs::relative(it->path(), from);
-            std::string dst = root_ + "/" + nm + "/" + rel.string();
+            std::string dst = root_ + "/" + nm + "/" + rel;
             dirs_.ensure(dirName(dst));
-            std::string content = readFile(it->path().string());
+            std::string content = readFile(from + "/" + rel);
             writeFileAtomic(dst, content.data(), content.size());
         }
         staticNodes_.emplace_back(nm, std::move(e.second));

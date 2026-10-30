@@ -14,17 +14,24 @@
 /// check_zarr_selftest.py, which reads them with zarr-python 3 and xarray.
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
+#include <functional>
 #include <fstream>
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <dirent.h>
+#include <ftw.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "eckit/testing/Test.h"
 
@@ -37,11 +44,136 @@
 
 namespace multio::test::zarr {
 
-namespace fs = std::filesystem;
-
 using multio::message::Message;
 using multio::message::Metadata;
 using multio::message::Peer;
+
+//----------------------------------------------------------------------------------------------------------------------
+// Minimal path helpers (POSIX), no C++17 <fs> library: with icpc + gcc 8 headers it uses the experimental ABI,
+// which crashes against the newer libstdc++ loaded at run time.
+
+/// '/'-joined path string
+class Path {
+public:
+    Path() = default;
+    Path(std::string s) : s_(std::move(s)) {}
+    Path(const char* s) : s_(s) {}
+    const std::string& string() const { return s_; }
+    Path parent() const {
+        auto p = s_.find_last_of('/');
+        return p == std::string::npos ? Path() : Path(p == 0 ? std::string("/") : s_.substr(0, p));
+    }
+    std::string filename() const {
+        auto p = s_.find_last_of('/');
+        return p == std::string::npos ? s_ : s_.substr(p + 1);
+    }
+    friend Path operator/(const Path& a, const std::string& b) {
+        if (a.s_.empty()) {
+            return Path(b);
+        }
+        return Path(a.s_.back() == '/' ? a.s_ + b : a.s_ + "/" + b);
+    }
+
+private:
+    std::string s_;
+};
+
+[[noreturn]] void pathError(const std::string& what, const Path& p, int err) {
+    throw std::runtime_error(what + " '" + p.string() + "': " + std::strerror(err));
+}
+
+bool exists(const Path& p) {
+    struct stat st;
+    return ::stat(p.string().c_str(), &st) == 0;
+}
+
+std::uintmax_t fileSize(const Path& p) {
+    struct stat st;
+    if (::stat(p.string().c_str(), &st) != 0) {
+        pathError("cannot stat", p, errno);
+    }
+    return static_cast<std::uintmax_t>(st.st_size);
+}
+
+/// mkdir -p
+void createDirectories(const Path& p) {
+    if (p.string().empty() || ::mkdir(p.string().c_str(), 0755) == 0) {
+        return;
+    }
+    int err = errno;
+    struct stat st;
+    if (err == EEXIST && ::stat(p.string().c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        return;
+    }
+    if (err == ENOENT && p.parent().string() != p.string()) {
+        createDirectories(p.parent());
+        if (::mkdir(p.string().c_str(), 0755) == 0 || errno == EEXIST) {
+            return;
+        }
+        err = errno;
+    }
+    pathError("cannot create directory", p, err);
+}
+
+/// rm -rf; a missing path is not an error
+void removeAll(const Path& p) {
+    struct stat st;
+    if (::lstat(p.string().c_str(), &st) != 0) {
+        if (errno == ENOENT) {
+            return;
+        }
+        pathError("cannot stat", p, errno);
+    }
+    auto rm = [](const char* path, const struct stat*, int, struct FTW*) { return ::remove(path) == 0 ? 0 : errno; };
+    int rc = ::nftw(p.string().c_str(), rm, 64, FTW_DEPTH | FTW_PHYS);
+    if (rc != 0) {
+        pathError("cannot remove", p, rc > 0 ? rc : errno);
+    }
+}
+
+Path absolute(const Path& p) {
+    if (!p.string().empty() && p.string()[0] == '/') {
+        return p;
+    }
+    std::vector<char> buf(4096);
+    while (::getcwd(buf.data(), buf.size()) == nullptr) {
+        if (errno != ERANGE) {
+            pathError("cannot get the working directory for", p, errno);
+        }
+        buf.resize(buf.size() * 2);
+    }
+    return Path(std::string(buf.data())) / p.string();
+}
+
+/// Call f(path, isRegularFile) for every entry below dir (recursing into directories, not into symbolic links
+/// to directories; isRegularFile follows symbolic links)
+void walk(const Path& dir, const std::function<void(const Path&, bool)>& f) {
+    DIR* d = ::opendir(dir.string().c_str());
+    if (d == nullptr) {
+        pathError("cannot open directory", dir, errno);
+    }
+    std::vector<std::string> names;
+    while (struct dirent* e = ::readdir(d)) {
+        if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) {
+            names.emplace_back(e->d_name);
+        }
+    }
+    ::closedir(d);
+    for (const auto& n : names) {
+        Path p = dir / n;
+        struct stat lst, st;
+        if (::lstat(p.string().c_str(), &lst) != 0) {
+            continue;
+        }
+        bool regular = ::stat(p.string().c_str(), &st) == 0 && S_ISREG(st.st_mode);
+        f(p, regular);
+        if (S_ISDIR(lst.st_mode)) {
+            walk(p, f);
+        }
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------
 
 constexpr std::int64_t NX = 5;
 constexpr std::int64_t NY = 4;
@@ -175,18 +307,18 @@ std::string planJson(const std::string& path, const std::string& layout, const s
     return oss.str();
 }
 
-void writeFile(const fs::path& p, const void* data, std::size_t n) {
-    fs::create_directories(p.parent_path());
-    std::ofstream out(p, std::ios::binary);
+void writeFile(const Path& p, const void* data, std::size_t n) {
+    createDirectories(p.parent());
+    std::ofstream out(p.string(), std::ios::binary);
     out.write(static_cast<const char*>(data), static_cast<std::streamsize>(n));
 }
 
-void writeText(const fs::path& p, const std::string& s) {
+void writeText(const Path& p, const std::string& s) {
     writeFile(p, s.data(), s.size());
 }
 
-std::string readText(const fs::path& p) {
-    std::ifstream in(p, std::ios::binary);
+std::string readText(const Path& p) {
+    std::ifstream in(p.string(), std::ios::binary);
     std::ostringstream oss;
     oss << in.rdbuf();
     return oss.str();
@@ -203,9 +335,9 @@ std::string arrayDoc(const std::string& shape, const std::string& chunk, const s
 
 /// A small coordinates store <dir>/<domain>.zarr as the IO-server prototype writes it, plus two
 /// arrays that must not be copied (a time-dependent variable and a level coordinate)
-void writeCoordinateStore(const fs::path& dir, const std::string& domain) {
-    fs::path s = dir / (domain + ".zarr");
-    fs::remove_all(s);
+void writeCoordinateStore(const Path& dir, const std::string& domain) {
+    Path s = dir / (domain + ".zarr");
+    removeAll(s);
     std::vector<std::pair<std::string, std::string>> nodes;
 
     std::vector<double> x(NX), y(NY), lat(NPTS), lon(NPTS);
@@ -270,7 +402,7 @@ void runSteps(MultioTestEnvironment& env, const std::string& domain, const std::
     }
 }
 
-std::vector<float> readFloats(const fs::path& p) {
+std::vector<float> readFloats(const Path& p) {
     std::string s = readText(p);
     std::vector<float> v(s.size() / sizeof(float));
     std::memcpy(v.data(), s.data(), v.size() * sizeof(float));
@@ -288,23 +420,23 @@ void checkLevelChunk(const std::vector<float>& vals, int id, std::int64_t step, 
     }
 }
 
-std::size_t countStaging(const fs::path& store) {
+std::size_t countStaging(const Path& store) {
     std::size_t n = 0;
-    for (const auto& e : fs::recursive_directory_iterator(store)) {
-        auto name = e.path().filename().string();
+    walk(store, [&](const Path& p, bool) {
+        auto name = p.filename();
         if (name.rfind(".staging", 0) == 0 || name.find(".tmp") != std::string::npos) {
             ++n;
         }
-    }
+    });
     return n;
 }
 
 void runLayout(const std::string& layout, const std::string& lastKind, const std::string& sub) {
     const std::string domain = "TESTDOM";
-    const fs::path root = fs::absolute(outRoot());
-    const fs::path out = root / sub;
-    const fs::path coords = root / "coords";
-    fs::remove_all(out);
+    const Path root = absolute(outRoot());
+    const Path out = root / sub;
+    const Path coords = root / "coords";
+    removeAll(out);
     writeCoordinateStore(coords, domain);
     registerDomain(domain);
 
@@ -313,9 +445,9 @@ void runLayout(const std::string& layout, const std::string& lastKind, const std
         runSteps(env, domain, lastKind);
     }  // destructor of the action finalises if no end-of-simulation flush arrived
 
-    const fs::path s = out / (domain + ".zarr");
-    EXPECT(fs::exists(s / "zarr.json"));
-    EXPECT(fs::exists(s / ".last_step"));
+    const Path s = out / (domain + ".zarr");
+    EXPECT(exists(s / "zarr.json"));
+    EXPECT(exists(s / ".last_step"));
     EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=96 time_index=2 inc=0002:00:00\n"));
     EXPECT_EQUAL(countStaging(s), 0u);
 
@@ -324,8 +456,8 @@ void runLayout(const std::string& layout, const std::string& lastKind, const std
     EXPECT(rootDoc.find("\"latitude\":") != std::string::npos);
     EXPECT(rootDoc.find("OLDVAR") == std::string::npos);
     EXPECT(rootDoc.find("\"dx_m\":2.5000000000000000E+003") != std::string::npos);  // copied verbatim
-    EXPECT(!fs::exists(s / "OLDVAR"));
-    EXPECT(fs::exists(s / "crs" / "c"));
+    EXPECT(!exists(s / "OLDVAR"));
+    EXPECT(exists(s / "crs" / "c"));
 
     // per-array metadata with the final time length
     const std::string tdoc = readText(s / "S_TEMPERATURE" / "zarr.json");
@@ -344,24 +476,24 @@ void runLayout(const std::string& layout, const std::string& lastKind, const std
         checkLevelChunk(readFloats(s / "S_TEMPERATURE" / "c" / "0" / "0" / "0" / "0"), 1, 0, 1);
         checkLevelChunk(readFloats(s / "S_TEMPERATURE" / "c" / "2" / "2" / "0" / "0"), 1, 96, 3);
         // level_K = [1,2]: KT only has level 1
-        EXPECT(fs::exists(s / "KT_ISOT_ALTIT" / "c" / "0" / "0" / "0" / "0"));
-        EXPECT(!fs::exists(s / "KT_ISOT_ALTIT" / "c" / "0" / "1" / "0" / "0"));
+        EXPECT(exists(s / "KT_ISOT_ALTIT" / "c" / "0" / "0" / "0" / "0"));
+        EXPECT(!exists(s / "KT_ISOT_ALTIT" / "c" / "0" / "1" / "0" / "0"));
         // HUMI.SPECIFI: from time 1 on, levels 1 and 3 only
-        EXPECT(!fs::exists(s / "S_HUMI.SPECIFI" / "c" / "0"));
-        EXPECT(fs::exists(s / "S_HUMI.SPECIFI" / "c" / "1" / "2" / "0" / "0"));
-        EXPECT(!fs::exists(s / "S_HUMI.SPECIFI" / "c" / "1" / "1" / "0" / "0"));
+        EXPECT(!exists(s / "S_HUMI.SPECIFI" / "c" / "0"));
+        EXPECT(exists(s / "S_HUMI.SPECIFI" / "c" / "1" / "2" / "0" / "0"));
+        EXPECT(!exists(s / "S_HUMI.SPECIFI" / "c" / "1" / "1" / "0" / "0"));
     }
     else {
         EXPECT(tdoc.find("\"sharding_indexed\"") != std::string::npos);
         EXPECT(tdoc.find("\"chunk_shape\":[1,3,4,5]") != std::string::npos);
         // one shard per (variable, time): 3 inner chunks + index of 3 x 16 bytes
-        const fs::path shard = s / "S_TEMPERATURE" / "c" / "1" / "0" / "0" / "0";
-        EXPECT(fs::exists(shard));
-        EXPECT_EQUAL(fs::file_size(shard), static_cast<std::uintmax_t>(3 * NPTS * 4 + 3 * 16));
-        EXPECT(!fs::exists(s / "S_TEMPERATURE" / "c" / "1" / "1"));
+        const Path shard = s / "S_TEMPERATURE" / "c" / "1" / "0" / "0" / "0";
+        EXPECT(exists(shard));
+        EXPECT_EQUAL(fileSize(shard), static_cast<std::uintmax_t>(3 * NPTS * 4 + 3 * 16));
+        EXPECT(!exists(s / "S_TEMPERATURE" / "c" / "1" / "1"));
         // KT: 1 of 2 inner chunks present, the other one marked missing in the index
-        const fs::path kt = s / "KT_ISOT_ALTIT" / "c" / "0" / "0" / "0" / "0";
-        EXPECT_EQUAL(fs::file_size(kt), static_cast<std::uintmax_t>(NPTS * 4 + 2 * 16));
+        const Path kt = s / "KT_ISOT_ALTIT" / "c" / "0" / "0" / "0" / "0";
+        EXPECT_EQUAL(fileSize(kt), static_cast<std::uintmax_t>(NPTS * 4 + 2 * 16));
         std::string b = readText(kt);
         std::uint64_t idx[4];
         std::memcpy(idx, b.data() + NPTS * 4, sizeof(idx));
@@ -388,8 +520,8 @@ CASE("finalisation in the destructor without end-of-simulation") {
 }
 
 CASE("new level on a frozen axis is an error") {
-    const fs::path out = fs::absolute(outRoot()) / "frozen-axis";
-    fs::remove_all(out);
+    const Path out = absolute(outRoot()) / "frozen-axis";
+    removeAll(out);
     const std::string domain = "ERRDOM";
     auto plan = std::string(R"({"name": "z", "actions": [{"type": "zarr", "path": ")") + out.string()
               + R"(", "layout": "chunk-per-level"}]})";
@@ -427,8 +559,8 @@ CASE("new level on a frozen axis is an error") {
     EXPECT_THROWS(env.process(full(48, 70000)));
     EXPECT_NO_THROW(env.process(flush(48)));
     // level_P has been written once, with the frozen levels
-    EXPECT(fs::exists(out / "ERRDOM.zarr" / "level_P" / "c" / "0"));
-    EXPECT_EQUAL(fs::file_size(out / "ERRDOM.zarr" / "level_P" / "c" / "0"), 16u);
+    EXPECT(exists(out / "ERRDOM.zarr" / "level_P" / "c" / "0"));
+    EXPECT_EQUAL(fileSize(out / "ERRDOM.zarr" / "level_P" / "c" / "0"), 16u);
     // a field for a step that was flushed already is an error too
     EXPECT_THROWS(env.process(full(0, 50000)));
 }
@@ -540,25 +672,25 @@ Message fpFieldMessage(const std::string& domain, const FpField& f, std::int64_t
                    eckit::Buffer(vals.data(), vals.size() * sizeof(double))};
 }
 
-std::size_t countValue(const fs::path& dir, float v) {
+std::size_t countValue(const Path& dir, float v) {
     std::size_t n = 0;
-    for (const auto& e : fs::recursive_directory_iterator(dir)) {
-        if (!e.is_regular_file() || e.path().filename() == "zarr.json") {
-            continue;
+    walk(dir, [&](const Path& p, bool regular) {
+        if (!regular || p.filename() == "zarr.json") {
+            return;
         }
-        for (float x : readFloats(e.path())) {
+        for (float x : readFloats(p)) {
             n += sameBits(x, v) ? 1 : 0;
         }
-    }
+    });
     return n;
 }
 
 void runFullPos(const std::string& layout, const std::string& sub) {
     const std::string domain = "PFTESTDOM";
-    const fs::path root = fs::absolute(outRoot());
-    const fs::path out = root / sub;
-    const fs::path coords = root / "coords";
-    fs::remove_all(out);
+    const Path root = absolute(outRoot());
+    const Path out = root / sub;
+    const Path coords = root / "coords";
+    removeAll(out);
     writeCoordinateStore(coords, domain);  // static arrays of the C+I window (NX x NY)
     registerDomain(domain, FNPTS);         // the clients' points cover the full C+I+E grid
     registerDomain("PFNOFIELDS", FNPTS);   // a domain that never gets a field
@@ -580,13 +712,13 @@ void runFullPos(const std::string& layout, const std::string& sub) {
         }
     }
 
-    EXPECT(!fs::exists(out / "PFNOFIELDS.zarr"));
-    const fs::path s = out / (domain + ".zarr");
-    EXPECT(fs::exists(s / "zarr.json"));
+    EXPECT(!exists(out / "PFNOFIELDS.zarr"));
+    const Path s = out / (domain + ".zarr");
+    EXPECT(exists(s / "zarr.json"));
     // two time steps (0 and 24), the empty steps 12 and 36 add none
     EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=24 time_index=1 inc=0000:30:00\n"));
     EXPECT(readText(s / "time" / "zarr.json").find("\"shape\":[2]") != std::string::npos);
-    EXPECT(!fs::exists(s / "time" / "c" / "2"));
+    EXPECT(!exists(s / "time" / "c" / "2"));
     EXPECT_EQUAL(countStaging(s), 0u);
 
     // array names and level axes as the IO-server prototype names FullPos output
@@ -602,10 +734,10 @@ void runFullPos(const std::string& layout, const std::string& sub) {
     const std::string cdoc = readText(s / "CLSTEMPERATURE" / "zarr.json");
     EXPECT(cdoc.find("\"shape\":[2,4,5]") != std::string::npos);
     EXPECT(cdoc.find("\"fa_prefix\":\"CLST\",\"fa_suffix\":\"EMPERATURE\"") != std::string::npos);
-    EXPECT(fs::exists(s / "SURFRAYT_SOLA_DE" / "zarr.json"));
+    EXPECT(exists(s / "SURFRAYT_SOLA_DE" / "zarr.json"));
     for (const char* bad : {"P100500TEMPERATURE", "KT273ISOT_ALTIT", "KT27", "S090HUMI.SPECIFI", "H005",
                             "C002_METEOSAT_09", "P_", "KT"}) {
-        EXPECT(!fs::exists(s / bad));
+        EXPECT(!exists(s / bad));
     }
     auto levels = [&](const std::string& ax) {
         std::string b = readText(s / ax / "c" / "0");
@@ -651,8 +783,8 @@ CASE("FullPos input: crop window, FullPos names, empty steps, shard-levels") {
 }
 
 CASE("payload size, crop window and flush errors") {
-    const fs::path out = fs::absolute(outRoot()) / "payload-errors";
-    fs::remove_all(out);
+    const Path out = absolute(outRoot()) / "payload-errors";
+    removeAll(out);
     const std::string domain = "SIZEDOM";
     auto plan = std::string(R"({"name": "z", "actions": [{"type": "zarr", "path": ")") + out.string()
               + R"(", "layout": "chunk-per-level"}]})";
@@ -699,8 +831,8 @@ CASE("payload size, crop window and flush errors") {
     // flushes before any field: no store, no error
     EXPECT_NO_THROW(env.process(flush(domain, 0, "step")));
     EXPECT_NO_THROW(env.process(flush("OTHERDOM", 0, "end-of-simulation")));
-    EXPECT(!fs::exists(out / "SIZEDOM.zarr"));
-    EXPECT(!fs::exists(out / "OTHERDOM.zarr"));
+    EXPECT(!exists(out / "SIZEDOM.zarr"));
+    EXPECT(!exists(out / "OTHERDOM.zarr"));
 
     EXPECT_NO_THROW(env.process(fld(0, NPTS, NPTS, 0)));            // plain nx*ny
     EXPECT_NO_THROW(env.process(fld(0, FNPTS, FNPTS, 15)));         // full grid + crop window (same field again)
@@ -719,7 +851,7 @@ CASE("payload size, crop window and flush errors") {
     EXPECT_NO_THROW(env.process(flush(domain, std::nullopt, "step")));  // no open step: nothing to do
     // end-of-simulation for a step without fields: no time step, just finalise
     EXPECT_NO_THROW(env.process(flush(domain, 3, "end-of-simulation")));
-    const fs::path s = out / "SIZEDOM.zarr";
+    const Path s = out / "SIZEDOM.zarr";
     EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=2 time_index=1 inc=0000:02:30\n"));
     EXPECT(readText(s / "SURFTEMPERATURE" / "zarr.json").find("\"shape\":[2,4,5]") != std::string::npos);
     EXPECT(readText(s / "time" / "zarr.json").find("\"shape\":[2]") != std::string::npos);

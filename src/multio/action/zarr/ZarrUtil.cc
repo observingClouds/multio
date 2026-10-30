@@ -17,6 +17,7 @@
 #include <fstream>
 #include <sstream>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -379,6 +380,68 @@ std::string readFile(const std::string& path) {
 bool pathExists(const std::string& path) {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0;
+}
+
+bool isDirectory(const std::string& path) {
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool isRegularFile(const std::string& path) {
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::vector<std::string> listDirectory(const std::string& path) {
+    DIR* d = ::opendir(path.c_str());
+    if (d == nullptr) {
+        ioError("cannot open directory", path, errno);
+    }
+    std::vector<std::string> names;
+    for (;;) {
+        errno = 0;
+        struct dirent* e = ::readdir(d);
+        if (e == nullptr) {
+            int err = errno;
+            ::closedir(d);
+            if (err != 0) {
+                ioError("cannot read directory", path, err);
+            }
+            break;
+        }
+        if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        names.emplace_back(e->d_name);
+    }
+    return names;
+}
+
+namespace {
+
+void listFilesBelow(const std::string& dir, const std::string& rel, std::vector<std::string>& out) {
+    for (const auto& name : listDirectory(dir)) {
+        std::string path = dir + "/" + name;
+        std::string r = rel.empty() ? name : rel + "/" + name;
+        struct stat st;
+        if (::lstat(path.c_str(), &st) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            listFilesBelow(path, r, out);
+        }
+        else if (S_ISREG(st.st_mode) || (S_ISLNK(st.st_mode) && isRegularFile(path))) {
+            out.push_back(std::move(r));
+        }
+    }
+}
+
+}  // namespace
+
+std::vector<std::string> listFilesRecursive(const std::string& dir) {
+    std::vector<std::string> out;
+    listFilesBelow(dir, std::string(), out);
+    return out;
 }
 
 void renamePath(const std::string& from, const std::string& to) {
