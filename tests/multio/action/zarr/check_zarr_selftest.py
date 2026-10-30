@@ -160,6 +160,100 @@ def check_shards_bytes(path):
         shutil.rmtree(tmp)
 
 
+# --- FullPos input (TestZarr.cc runFullPos): full C+I+E payload cropped to the NX x NY window, FullPos
+# article names / raw CPREF, flushes at steps 12 and 36 without fields
+FP_STEPS = [0, 24]
+SENTINEL = np.float32(-9999.0)
+# array id, array name, level axis (None: 2-D), level of the field (as normalised), fa_prefix, fa_suffix
+FP_FIELDS = [
+    (1, "P_TEMPERATURE", "level_P", 85000, "P", "TEMPERATURE"),        # P / TEMPERATURE / 85000
+    (1, "P_TEMPERATURE", "level_P", 50000, "P", "TEMPERATURE"),
+    (1, "P_TEMPERATURE", "level_P", 100500, "P", "TEMPERATURE"),       # P100500 / TEMPERATURE / 100500
+    (1, "P_TEMPERATURE", "level_P", 70000, "P", "TEMPERATURE"),        # P, no levelist, P70000TEMPERATURE
+    (2, "KT_ISOT_ALTIT", "level_K", 273, "KT", "ISOT_ALTIT"),          # 'KT  ' / ISOT_ALTIT / 273
+    (2, "KT_ISOT_ALTIT", "level_K", 276, "KT", "ISOT_ALTIT"),          # name only KT276ISOT_ALTIT
+    (3, "H_TEMPERATURE", "level_H", 15, "H", "TEMPERATURE"),
+    (3, "H_TEMPERATURE", "level_H", 500, "H", "TEMPERATURE"),          # name only H00500TEMPERATURE
+    (4, "S_HUMI.SPECIFI", "level_S", 90, "S", "HUMI.SPECIFI"),         # S090 / HUMI.SPECIFI / 0
+    (5, "S_TEMPERATURE", "level_S", 90, "S", "TEMPERATURE"),           # name only S090TEMPERATURE
+    (6, "H_WIND.U.PHYS", "level_H", 500, "H", "WIND.U.PHYS"),          # H005 / 00WIND.U.PHYS / 0
+    (7, "C_METEOSAT_09", "level_C", 6, "C", "_METEOSAT_09"),
+    (7, "C_METEOSAT_09", "level_C", 2, "C", "_METEOSAT_09"),           # name only C002_METEOSAT_09
+    (8, "CLSTEMPERATURE", None, 0, "CLST", "EMPERATURE"),              # CLST / EMPERATURE
+    (9, "SURFTEMPERATURE", None, 0, "SURF", "TEMPERATURE"),            # name only
+    (10, "SURFRAYT_SOLA_DE", None, 0, "SURF", "RAYT SOLA DE"),
+]
+FP_AXES = {"level_P": [50000, 70000, 85000, 100500], "level_K": [273, 276], "level_H": [15, 500],
+           "level_S": [90], "level_C": [2, 6]}
+
+
+def fp_value(vid, step, level, idx):
+    if vid == 9 and idx == 3:
+        return np.nan
+    return vid * 1.0e6 + step * 1000.0 + level * 0.01 + idx * 0.001
+
+
+def fp_expected(name):
+    fields = [f for f in FP_FIELDS if f[1] == name]
+    axis = fields[0][2]
+    idx = np.arange(NPTS)
+    shape = (len(FP_STEPS), NY, NX) if axis is None else (len(FP_STEPS), len(FP_AXES[axis]), NY, NX)
+    out = np.full(shape, np.nan, dtype=np.float32)
+    for t, s in enumerate(FP_STEPS):
+        for vid, _, ax, lev, _, _ in fields:
+            plane = np.array([fp_value(vid, s, lev, i) for i in idx]).astype(np.float32).reshape(NY, NX)
+            if ax is None:
+                out[t] = plane
+            else:
+                out[t, FP_AXES[ax].index(lev)] = plane
+    return out
+
+
+def check_fullpos(path, label, consolidated):
+    g = zarr.open_group(path, mode="r", use_consolidated=consolidated)
+    names = set(g.array_keys())
+    want = {f[1] for f in FP_FIELDS} | set(FP_AXES) | {"x", "y", "latitude", "longitude", "crs", "time"}
+    check(names == want, f"{label} consolidated={consolidated}: arrays {sorted(names)} != {sorted(want)}")
+    for name in sorted({f[1] for f in FP_FIELDS}):
+        if name not in names:
+            continue
+        f = next(f for f in FP_FIELDS if f[1] == name)
+        a = g[name]
+        e = fp_expected(name)
+        check(a.shape == e.shape, f"{label}: {name} shape {a.shape} != {e.shape}")
+        if a.shape == e.shape:
+            v = a[...]
+            check(bit_equal(v, e), f"{label} consolidated={consolidated}: {name} values differ")
+            check(not np.any(v == SENTINEL), f"{label}: {name} contains E-zone sentinel values")
+        dims = ["time"] + ([f[2]] if f[2] else []) + ["y", "x"]
+        check(list(a.metadata.dimension_names) == dims, f"{label}: {name} dims {a.metadata.dimension_names}")
+        attrs = dict(a.attrs)
+        check(attrs.get("fa_prefix") == f[4] and attrs.get("fa_suffix") == f[5]
+              and attrs.get("long_name") == f"{f[4]}*{f[5]}", f"{label}: {name} attrs {attrs}")
+    for ax, lev in FP_AXES.items():
+        if ax in names:
+            check(np.array_equal(g[ax][...], np.array(lev, dtype=np.float64)), f"{label}: {ax} {g[ax][...]}")
+    check(np.array_equal(g["time"][...], np.array([s * TIMESTEP for s in FP_STEPS], dtype=np.float64)),
+          f"{label}: time {g['time'][...]} (steps without fields must not add a time step)")
+    ds = xr.open_zarr(path, consolidated=consolidated, zarr_format=3)
+    check(ds.sizes["time"] == len(FP_STEPS), f"{label} xr: time size {ds.sizes['time']}")
+    check(ds["P_TEMPERATURE"].dims == ("time", "level_P", "y", "x"), f"{label} xr: P dims")
+    check(list(ds.level_P.values) == FP_AXES["level_P"], f"{label} xr: level_P {ds.level_P.values}")
+    for name in {f[1] for f in FP_FIELDS}:
+        check(bit_equal(ds[name].values, fp_expected(name)), f"{label} xr consolidated={consolidated}: {name}")
+    ds.close()
+
+
+def check_payload_errors(root):
+    path = os.path.join(root, "payload-errors", "SIZEDOM.zarr")
+    g = zarr.open_group(path, mode="r")
+    check(set(g.array_keys()) == {"SURFTEMPERATURE", "time"}, f"payload-errors: arrays {sorted(g.array_keys())}")
+    check(np.array_equal(g["time"][...], np.array([0.0, 150.0])), f"payload-errors: time {g['time'][...]}")
+    check(np.array_equal(g["SURFTEMPERATURE"][...], np.ones((2, NY, NX), dtype=np.float32)),
+          "payload-errors: SURFTEMPERATURE values")
+    check(not os.path.exists(os.path.join(root, "payload-errors", "OTHERDOM.zarr")), "payload-errors: OTHERDOM")
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "zarr-selftest"
     print(f"zarr {zarr.__version__} ({zarr.__file__}), xarray {xr.__version__}, numpy {np.__version__}")
@@ -181,6 +275,19 @@ def main():
           f"shard-levels: shards {g2['S_TEMPERATURE'].shards} chunks {g2['S_TEMPERATURE'].chunks}")
     check(count_files(stores["shard-levels"]) < count_files(stores["chunk-per-level"]), "shard-levels: file count")
     check_shards_bytes(stores["shard-levels"])
+
+    fp = {}
+    for sub in ["fullpos-chunk-per-level", "fullpos-shard-levels"]:
+        fp[sub] = os.path.join(root, sub, "PFTESTDOM.zarr")
+        for consolidated in (True, False):
+            check_fullpos(fp[sub], sub, consolidated)
+        check(not os.path.exists(os.path.join(root, sub, "PFNOFIELDS.zarr")), f"{sub}: PFNOFIELDS store created")
+        print(f"{sub}: {count_files(fp[sub])} files")
+    g1 = zarr.open_group(fp["fullpos-chunk-per-level"], mode="r")
+    g2 = zarr.open_group(fp["fullpos-shard-levels"], mode="r")
+    for name in {f[1] for f in FP_FIELDS}:
+        check(bit_equal(g1[name][...], g2[name][...]), f"fullpos shard vs chunk: {name}")
+    check_payload_errors(root)
 
     if failures:
         print(f"{len(failures)} FAILURES")

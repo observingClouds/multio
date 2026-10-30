@@ -13,6 +13,7 @@
 /// (directory $MULTIO_ZARR_SELFTEST_DIR, default ./zarr-selftest) for the python check
 /// check_zarr_selftest.py, which reads them with zarr-python 3 and xarray.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -86,9 +88,9 @@ const Peer SERVER{"server", 0};
 const std::vector<Peer> CLIENTS = {Peer{"client", 0}, Peer{"client", 1}};
 
 /// client c owns the global indices i with i % 2 == c
-std::vector<std::int32_t> clientIndices(std::size_t c) {
+std::vector<std::int32_t> clientIndices(std::size_t c, std::int64_t npts = NPTS) {
     std::vector<std::int32_t> idx;
-    for (std::int32_t i = 0; i < NPTS; ++i) {
+    for (std::int32_t i = 0; i < npts; ++i) {
         if (static_cast<std::size_t>(i % 2) == c) {
             idx.push_back(i);
         }
@@ -96,15 +98,15 @@ std::vector<std::int32_t> clientIndices(std::size_t c) {
     return idx;
 }
 
-void registerDomain(const std::string& domain) {
+void registerDomain(const std::string& domain, std::int64_t npts = NPTS) {
     for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
-        auto idx = clientIndices(c);
+        auto idx = clientIndices(c, npts);
         Metadata md;
         md.set("name", domain);
         md.set("domain", domain);
         md.set("category", std::string("ial-domain-map"));
         md.set("representation", std::string("unstructured"));
-        md.set("misc-globalSize", NPTS);
+        md.set("misc-globalSize", npts);
         md.set("toAllServers", true);
         Message msg{Message::Header{Message::Tag::Domain, CLIENTS[c], SERVER, std::move(md)},
                     eckit::Buffer(idx.data(), idx.size() * sizeof(std::int32_t))};
@@ -429,6 +431,302 @@ CASE("new level on a frozen axis is an error") {
     EXPECT_EQUAL(fs::file_size(out / "ERRDOM.zarr" / "level_P" / "c" / "0"), 16u);
     // a field for a step that was flushed already is an error too
     EXPECT_THROWS(env.process(full(0, 50000)));
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// Real IAL FullPos input: full C+I+E grid payload with a crop window, FullPos article names / raw CPREF,
+// flushes for steps without fields, end-of-simulation without an open step
+
+constexpr std::int64_t FNXF = 7;  // full grid (C+I+E)
+constexpr std::int64_t FNYF = 6;
+constexpr std::int64_t FX0 = 2;  // 1-based offset of the NX x NY (C+I) window
+constexpr std::int64_t FY0 = 2;
+constexpr std::int64_t FNPTS = FNXF * FNYF;
+constexpr double SENTINEL = -9999.0;  // E zone (and the rest outside the window): must never be written
+const std::vector<std::int64_t> FP_FIELD_STEPS = {0, 24};
+// flushes: step 12 and 36 have no field (12: empty step, 36: end-of-simulation without an open step)
+const std::vector<std::pair<std::int64_t, std::string>> FP_FLUSHES
+    = {{0, "step"}, {12, "step"}, {24, "step"}, {36, "end-of-simulation"}};
+
+/// One FullPos field (one level) as IAL sends it; the python check has the same table
+struct FpField {
+    int id;               // array id (value formula)
+    std::string levtype;  // raw CPREF; empty: article name only
+    std::string suffix;   // raw CSUFF
+    std::int64_t levelist;
+    bool sendLevelist;
+    std::string name;   // FA article name
+    std::int64_t level;  // expected level after normalisation (0: 2-D)
+};
+
+const std::vector<FpField> FP_FIELDS = {
+    // INI2WRFP: level type letter + ILEVG (pressure in Pa, height in m)
+    {1, "P", "TEMPERATURE", 85000, true, "P85000TEMPERATURE", 85000},
+    {1, "P", "TEMPERATURE", 50000, true, "P50000TEMPERATURE", 50000},
+    // pressure above 1000 hPa: the level is also written into CPREF(2:7)
+    {1, "P100500", "TEMPERATURE", 100500, true, "P100500TEMPERATU", 100500},
+    // bare level type without levelist: the level comes from the article name
+    {1, "P", "TEMPERATURE", 0, false, "P70000TEMPERATURE", 70000},
+    // iso-T altitude from the top, CPREF with trailing blanks as Fortran sends it
+    {2, "KT  ", "ISOT_ALTIT", 273, true, "KT273ISOT_ALTIT", 273},
+    {2, "", "", 0, false, "KT276ISOT_ALTIT", 276},
+    {3, "H", "TEMPERATURE", 15, true, "H00015TEMPERATURE", 15},
+    {3, "", "", 0, false, "H00500TEMPERATURE", 500},
+    // level digits in the prefix (IOGRIDA_MOD convention), also cut inside the level
+    {4, "S090", "HUMI.SPECIFI", 0, true, "S090HUMI.SPECIFI", 90},
+    {5, "", "", 0, false, "S090TEMPERATURE", 90},
+    {6, "H005", "00WIND.U.PHYS", 0, true, "H00500WIND.U.PHY", 500},
+    {7, "C", "_METEOSAT_09", 6, true, "C006_METEOSAT_09", 6},
+    {7, "", "", 0, false, "C002_METEOSAT_09", 2},
+    // 2-D: CPREF = CLNAME(1:4)
+    {8, "CLST", "EMPERATURE", 0, true, "CLSTEMPERATURE", 0},
+    {9, "", "", 0, false, "SURFTEMPERATURE", 0},
+    {10, "SURF", "RAYT SOLA DE", 0, true, "SURFRAYT SOLA DE", 0},
+};
+
+double fpValue(int id, std::int64_t step, std::int64_t level, std::int64_t idx) {
+    if (id == 9 && idx == 3) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return id * 1.0e6 + step * 1000.0 + level * 0.01 + idx * 0.001;
+}
+
+/// Full grid payload: window point (i, j) (0-based) at (FY0-1+j)*FNXF + (FX0-1+i), everything else SENTINEL
+std::vector<double> fpFullGrid(const FpField& f, std::int64_t step) {
+    std::vector<double> g(FNPTS, SENTINEL);
+    for (std::int64_t j = 0; j < NY; ++j) {
+        for (std::int64_t i = 0; i < NX; ++i) {
+            g[(FY0 - 1 + j) * FNXF + (FX0 - 1 + i)] = fpValue(f.id, step, f.level, j * NX + i);
+        }
+    }
+    return g;
+}
+
+void setFpGeometry(Metadata& md) {
+    md.set("geometry-nx", NX);
+    md.set("geometry-ny", NY);
+    md.set("geometry-nx-full", FNXF);
+    md.set("geometry-ny-full", FNYF);
+    md.set("geometry-x0", FX0);
+    md.set("geometry-y0", FY0);
+}
+
+Message fpFieldMessage(const std::string& domain, const FpField& f, std::int64_t step, std::size_t c) {
+    Metadata md;
+    md.set("category", std::string("ial-field"));
+    md.set("domain", domain);
+    md.set("misc-globalSize", FNPTS);
+    md.set("misc-precision", std::string("double"));
+    md.set("name", f.name);
+    if (!f.levtype.empty()) {
+        md.set("levtype", f.levtype);
+        md.set("suffix", f.suffix);
+        if (f.sendLevelist) {
+            md.set("levelist", f.levelist);
+        }
+    }
+    md.set("grib-code", std::int64_t{0});
+    md.set("step", step);
+    md.set("timestep", TIMESTEP);
+    md.set("forecastReferenceTime", FRT);
+    setFpGeometry(md);
+
+    const auto full = fpFullGrid(f, step);
+    std::vector<double> vals;
+    for (auto i : clientIndices(c, FNPTS)) {
+        vals.push_back(full[i]);
+    }
+    return Message{Message::Header{Message::Tag::Field, CLIENTS[c], SERVER, std::move(md)},
+                   eckit::Buffer(vals.data(), vals.size() * sizeof(double))};
+}
+
+std::size_t countValue(const fs::path& dir, float v) {
+    std::size_t n = 0;
+    for (const auto& e : fs::recursive_directory_iterator(dir)) {
+        if (!e.is_regular_file() || e.path().filename() == "zarr.json") {
+            continue;
+        }
+        for (float x : readFloats(e.path())) {
+            n += sameBits(x, v) ? 1 : 0;
+        }
+    }
+    return n;
+}
+
+void runFullPos(const std::string& layout, const std::string& sub) {
+    const std::string domain = "PFTESTDOM";
+    const fs::path root = fs::absolute(outRoot());
+    const fs::path out = root / sub;
+    const fs::path coords = root / "coords";
+    fs::remove_all(out);
+    writeCoordinateStore(coords, domain);  // static arrays of the C+I window (NX x NY)
+    registerDomain(domain, FNPTS);         // the clients' points cover the full C+I+E grid
+    registerDomain("PFNOFIELDS", FNPTS);   // a domain that never gets a field
+
+    {
+        auto env = MultioTestEnvironment(planJson(out.string(), layout, coords.string()));
+        for (const auto& [step, kind] : FP_FLUSHES) {
+            if (std::find(FP_FIELD_STEPS.begin(), FP_FIELD_STEPS.end(), step) != FP_FIELD_STEPS.end()) {
+                for (const auto& f : FP_FIELDS) {
+                    for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                        env.process(fpFieldMessage(domain, f, step, c));
+                    }
+                }
+            }
+            for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                EXPECT_NO_THROW(env.process(flushMessage(domain, step, kind, c)));
+                EXPECT_NO_THROW(env.process(flushMessage("PFNOFIELDS", step, kind, c)));
+            }
+        }
+    }
+
+    EXPECT(!fs::exists(out / "PFNOFIELDS.zarr"));
+    const fs::path s = out / (domain + ".zarr");
+    EXPECT(fs::exists(s / "zarr.json"));
+    // two time steps (0 and 24), the empty steps 12 and 36 add none
+    EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=24 time_index=1 inc=0000:30:00\n"));
+    EXPECT(readText(s / "time" / "zarr.json").find("\"shape\":[2]") != std::string::npos);
+    EXPECT(!fs::exists(s / "time" / "c" / "2"));
+    EXPECT_EQUAL(countStaging(s), 0u);
+
+    // array names and level axes as the IO-server prototype names FullPos output
+    const std::string pdoc = readText(s / "P_TEMPERATURE" / "zarr.json");
+    EXPECT(pdoc.find("\"shape\":[2,4,4,5]") != std::string::npos);
+    EXPECT(pdoc.find("\"level_P\"") != std::string::npos);
+    EXPECT(pdoc.find("\"fa_prefix\":\"P\"") != std::string::npos);
+    EXPECT(readText(s / "KT_ISOT_ALTIT" / "zarr.json").find("\"shape\":[2,2,4,5]") != std::string::npos);
+    EXPECT(readText(s / "H_TEMPERATURE" / "zarr.json").find("\"shape\":[2,2,4,5]") != std::string::npos);
+    EXPECT(readText(s / "H_WIND.U.PHYS" / "zarr.json").find("\"fa_suffix\":\"WIND.U.PHYS\"") != std::string::npos);
+    EXPECT(readText(s / "S_HUMI.SPECIFI" / "zarr.json").find("\"shape\":[2,1,4,5]") != std::string::npos);
+    EXPECT(readText(s / "C_METEOSAT_09" / "zarr.json").find("\"fa_suffix\":\"_METEOSAT_09\"") != std::string::npos);
+    const std::string cdoc = readText(s / "CLSTEMPERATURE" / "zarr.json");
+    EXPECT(cdoc.find("\"shape\":[2,4,5]") != std::string::npos);
+    EXPECT(cdoc.find("\"fa_prefix\":\"CLST\",\"fa_suffix\":\"EMPERATURE\"") != std::string::npos);
+    EXPECT(fs::exists(s / "SURFRAYT_SOLA_DE" / "zarr.json"));
+    for (const char* bad : {"P100500TEMPERATURE", "KT273ISOT_ALTIT", "KT27", "S090HUMI.SPECIFI", "H005",
+                            "C002_METEOSAT_09", "P_", "KT"}) {
+        EXPECT(!fs::exists(s / bad));
+    }
+    auto levels = [&](const std::string& ax) {
+        std::string b = readText(s / ax / "c" / "0");
+        std::vector<double> v(b.size() / sizeof(double));
+        std::memcpy(v.data(), b.data(), b.size());
+        return v;
+    };
+    EXPECT(levels("level_P") == (std::vector<double>{50000, 70000, 85000, 100500}));
+    EXPECT(levels("level_K") == (std::vector<double>{273, 276}));
+    EXPECT(levels("level_H") == (std::vector<double>{15, 500}));
+    EXPECT(levels("level_S") == (std::vector<double>{90}));
+    EXPECT(levels("level_C") == (std::vector<double>{2, 6}));
+
+    // only the window is written: no sentinel anywhere in the data
+    for (const char* v : {"P_TEMPERATURE", "KT_ISOT_ALTIT", "H_TEMPERATURE", "S_TEMPERATURE", "C_METEOSAT_09",
+                          "CLSTEMPERATURE", "SURFTEMPERATURE"}) {
+        EXPECT_EQUAL(countValue(s / v / "c", static_cast<float>(SENTINEL)), 0u);
+    }
+    // 2-D, time index 1 (step 24): the window values in C order
+    {
+        auto vals = readFloats(s / "CLSTEMPERATURE" / "c" / "1" / "0" / "0");
+        EXPECT_EQUAL(vals.size(), static_cast<std::size_t>(NPTS));
+        for (std::int64_t i = 0; i < NPTS && i < static_cast<std::int64_t>(vals.size()); ++i) {
+            EXPECT(sameBits(vals[i], static_cast<float>(fpValue(8, 24, 0, i))));
+        }
+    }
+    if (layout == "chunk-per-level") {
+        // level_P = [50000, 70000, 85000, 100500]: k = 3 is 100500
+        auto vals = readFloats(s / "P_TEMPERATURE" / "c" / "0" / "3" / "0" / "0");
+        EXPECT_EQUAL(vals.size(), static_cast<std::size_t>(NPTS));
+        for (std::int64_t i = 0; i < NPTS && i < static_cast<std::int64_t>(vals.size()); ++i) {
+            EXPECT(sameBits(vals[i], static_cast<float>(fpValue(1, 0, 100500, i))));
+        }
+    }
+}
+
+CASE("FullPos input: crop window, FullPos names, empty steps, chunk-per-level") {
+    runFullPos("chunk-per-level", "fullpos-chunk-per-level");
+}
+
+CASE("FullPos input: crop window, FullPos names, empty steps, shard-levels") {
+    runFullPos("shard-levels", "fullpos-shard-levels");
+}
+
+CASE("payload size, crop window and flush errors") {
+    const fs::path out = fs::absolute(outRoot()) / "payload-errors";
+    fs::remove_all(out);
+    const std::string domain = "SIZEDOM";
+    auto plan = std::string(R"({"name": "z", "actions": [{"type": "zarr", "path": ")") + out.string()
+              + R"(", "layout": "chunk-per-level"}]})";
+    auto env = MultioTestEnvironment(plan);
+
+    // fld(step, npayload, globalSize, crop keys to set: bit 0 nx-full, 1 ny-full, 2 x0, 3 y0)
+    auto fld = [&](std::int64_t step, std::int64_t npayload, std::int64_t globalSize, int cropBits,
+                   std::int64_t x0 = FX0) {
+        Metadata md;
+        md.set("domain", domain);
+        md.set("misc-globalSize", globalSize);
+        md.set("misc-precision", std::string("double"));
+        md.set("name", std::string("SURFTEMPERATURE"));
+        md.set("step", step);
+        md.set("timestep", TIMESTEP);
+        md.set("geometry-nx", NX);
+        md.set("geometry-ny", NY);
+        if (cropBits & 1) {
+            md.set("geometry-nx-full", FNXF);
+        }
+        if (cropBits & 2) {
+            md.set("geometry-ny-full", FNYF);
+        }
+        if (cropBits & 4) {
+            md.set("geometry-x0", x0);
+        }
+        if (cropBits & 8) {
+            md.set("geometry-y0", FY0);
+        }
+        std::vector<double> vals(npayload, 1.0);
+        return Message{Message::Header{Message::Tag::Field, SERVER, SERVER, std::move(md)},
+                       eckit::Buffer(vals.data(), vals.size() * sizeof(double))};
+    };
+    auto flush = [&](const std::string& dom, std::optional<std::int64_t> step, const std::string& kind) {
+        Metadata md;
+        md.set("domain", dom);
+        if (step) {
+            md.set("step", *step);
+        }
+        md.set("flushKind", kind);
+        return Message{Message::Header{Message::Tag::Flush, SERVER, SERVER, std::move(md)}};
+    };
+
+    // flushes before any field: no store, no error
+    EXPECT_NO_THROW(env.process(flush(domain, 0, "step")));
+    EXPECT_NO_THROW(env.process(flush("OTHERDOM", 0, "end-of-simulation")));
+    EXPECT(!fs::exists(out / "SIZEDOM.zarr"));
+    EXPECT(!fs::exists(out / "OTHERDOM.zarr"));
+
+    EXPECT_NO_THROW(env.process(fld(0, NPTS, NPTS, 0)));            // plain nx*ny
+    EXPECT_NO_THROW(env.process(fld(0, FNPTS, FNPTS, 15)));         // full grid + crop window (same field again)
+    EXPECT_THROWS(env.process(fld(0, FNPTS, FNPTS, 0)));            // full grid without the crop keys
+    EXPECT_THROWS(env.process(fld(0, FNPTS, FNPTS, 7)));            // incomplete crop keys
+    EXPECT_THROWS(env.process(fld(0, NPTS, NPTS, 15)));             // crop keys but an nx*ny payload
+    EXPECT_THROWS(env.process(fld(0, FNPTS, FNPTS, 15, FNXF)));     // window outside the full grid
+    EXPECT_THROWS(env.process(fld(0, NPTS, FNPTS, 0)));             // payload != misc-globalSize (not aggregated)
+    EXPECT_THROWS(env.process(fld(0, FNPTS - 1, FNPTS - 1, 15)));   // payload != nx_full*ny_full
+    EXPECT_NO_THROW(env.process(flush(domain, 0, "step")));
+    EXPECT_NO_THROW(env.process(flush(domain, 0, "step")));         // repeated flush of a closed step
+    EXPECT_NO_THROW(env.process(flush(domain, 1, "step")));         // step without fields
+    EXPECT_THROWS(env.process(fld(1, NPTS, NPTS, 0)));              // field for that (flushed) step
+    EXPECT_NO_THROW(env.process(fld(2, FNPTS, FNPTS, 15)));
+    EXPECT_NO_THROW(env.process(flush(domain, 2, "step")));
+    EXPECT_NO_THROW(env.process(flush(domain, std::nullopt, "step")));  // no open step: nothing to do
+    // end-of-simulation for a step without fields: no time step, just finalise
+    EXPECT_NO_THROW(env.process(flush(domain, 3, "end-of-simulation")));
+    const fs::path s = out / "SIZEDOM.zarr";
+    EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=2 time_index=1 inc=0000:02:30\n"));
+    EXPECT(readText(s / "SURFTEMPERATURE" / "zarr.json").find("\"shape\":[2,4,5]") != std::string::npos);
+    EXPECT(readText(s / "time" / "zarr.json").find("\"shape\":[2]") != std::string::npos);
+    EXPECT(readText(s / "zarr.json").find("\"shape\":[2,4,5]") != std::string::npos);
+    // close-connection after end-of-simulation: nothing changes
+    EXPECT_NO_THROW(env.process(flush("global", std::nullopt, "close-connection")));
+    EXPECT(readText(s / "time" / "zarr.json").find("\"shape\":[2]") != std::string::npos);
 }
 
 CASE("configuration errors") {
