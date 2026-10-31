@@ -103,7 +103,7 @@ const char* BYTES_CODEC = "{\"name\":\"bytes\",\"configuration\":{\"endian\":\"l
 /// zarr v3 array document, members in the order of ZARR_STORE_ARRAY_META
 std::string arrayDocument(const std::vector<std::int64_t>& shape, const char* dtype,
                           const std::vector<std::int64_t>& chunk, const std::string& codecs, const std::string& attrs,
-                          const std::vector<std::string>& dims) {
+                          const std::vector<std::string>& dims, const char* fill = "\"NaN\"") {
     std::string j;
     j.reserve(512 + attrs.size());
     j += "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":";
@@ -113,7 +113,9 @@ std::string arrayDocument(const std::vector<std::int64_t>& shape, const char* dt
     j += "\",\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":";
     j += jsonIntArray(chunk);
     j += "}},\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}}";
-    j += ",\"fill_value\":\"NaN\",\"codecs\":";
+    j += ",\"fill_value\":";
+    j += fill;
+    j += ",\"codecs\":";
     j += codecs;
     j += ",\"attributes\":";
     j += attrs;
@@ -183,10 +185,7 @@ void ZarrStore::createStore(const StoreSetup& setup) {
         }
     }
 
-    // grid_mapping / coordinates attributes only when latitude and longitude exist (LLATLON of the prototype)
-    hasLatLon_ = std::count_if(staticNodes_.begin(), staticNodes_.end(),
-                               [](const auto& n) { return n.first == "latitude" || n.first == "longitude"; })
-              == 2;
+    updateHasLatLon();
 
     // Grid size
     auto staticShape = [&](const std::string& nm) -> std::optional<std::int64_t> {
@@ -236,6 +235,7 @@ void ZarrStore::createStore(const StoreSetup& setup) {
         eckit::Log::warning() << "zarr action: " << name_
                               << ": no forecastReferenceTime, time units refer to 1970-01-01T00:00:00" << std::endl;
     }
+    frt_ = frt;
     timeUnits_ = "seconds since " + frt;
 
     if (!srcAttrs.empty()) {
@@ -308,6 +308,138 @@ void ZarrStore::copyStaticArrays(const std::string& src) {
         }
         staticNodes_.emplace_back(nm, std::move(e.second));
     }
+}
+
+void ZarrStore::updateHasLatLon() {
+    // grid_mapping / coordinates attributes only when latitude and longitude exist (LLATLON of the prototype)
+    hasLatLon_ = std::count_if(staticNodes_.begin(), staticNodes_.end(),
+                               [](const auto& n) { return n.first == "latitude" || n.first == "longitude"; })
+              == 2;
+}
+
+void ZarrStore::addStatic(const StaticArray& a, const std::optional<std::string>& groupAttributes) {
+    auto fail = [&](const std::string& why) {
+        throw eckit::UserError("zarr action: static array '" + a.name + "' of domain " + name_ + ": " + why, Here());
+    };
+
+    // Name
+    if (a.name.empty()) {
+        fail("empty array name");
+    }
+    if (a.name == "time" || startsWith(a.name, "level_")) {
+        fail("the name is reserved for a generated coordinate (time, level_*)");
+    }
+    if (a.name[0] == '.' || a.name.find('/') != std::string::npos || a.name.find('\\') != std::string::npos) {
+        fail("not a valid array name");
+    }
+    if (varByName_.find(a.name) != varByName_.end()) {
+        fail("a time-dependent array of that name exists in the store");
+    }
+
+    // Dimensions, shape, data type
+    if (a.dims.size() != a.shape.size()) {
+        std::ostringstream oss;
+        oss << a.dims.size() << " dimension names (zarr-dimensions) but rank " << a.shape.size() << " (zarr-shape)";
+        fail(oss.str());
+    }
+    std::size_t elem = 0;
+    const char* fill = nullptr;
+    if (a.dtype == "float64") {
+        elem = 8;
+        fill = "\"NaN\"";
+    }
+    else if (a.dtype == "int32") {
+        elem = 4;
+        fill = "0";
+    }
+    else {
+        fail("unknown data type '" + a.dtype + "' (float64 or int32)");
+    }
+    std::size_t count = 1;
+    for (std::size_t i = 0; i < a.shape.size(); ++i) {
+        const std::string& d = a.dims[i];
+        if (d.empty()) {
+            fail("empty dimension name");
+        }
+        if (d == "time") {
+            fail("a static array cannot have the dimension time");
+        }
+        if (std::count(a.dims.begin(), a.dims.end(), d) != 1) {
+            fail("dimension " + d + " appears twice");
+        }
+        if (a.shape[i] < 1) {
+            fail("dimension " + d + " has size " + std::to_string(a.shape[i]) + " (must be >= 1)");
+        }
+        if (d == "x" && a.shape[i] != nx_) {
+            fail("dimension x has size " + std::to_string(a.shape[i]) + ", but the store has nx = " + std::to_string(nx_));
+        }
+        if (d == "y" && a.shape[i] != ny_) {
+            fail("dimension y has size " + std::to_string(a.shape[i]) + ", but the store has ny = " + std::to_string(ny_));
+        }
+        count *= static_cast<std::size_t>(a.shape[i]);
+    }
+    if (a.data.size() != count * elem) {
+        std::ostringstream oss;
+        oss << a.data.size() << " bytes of data, expected " << count << " values of " << a.dtype;
+        fail(oss.str());
+    }
+
+    // Files: one chunk holding the whole array (key c, c/0, c/0/0, ...), then the array metadata
+    const std::string dir = root_ + "/" + a.name;
+    std::string chunkRel = "c";
+    for (std::size_t i = 0; i < a.shape.size(); ++i) {
+        chunkRel += "/0";
+    }
+    if (isDirectory(dir)) {
+        // replaced array (coordinates-from copy, earlier message, earlier run): no stale chunks of another layout
+        for (const auto& rel : listFilesRecursive(dir)) {
+            if (rel != "zarr.json" && rel != chunkRel) {
+                removeFile(dir + "/" + rel);
+            }
+        }
+    }
+    const std::string doc
+        = arrayDocument(a.shape, a.dtype.c_str(), a.shape, std::string("[") + BYTES_CODEC + "]", a.attributes, a.dims,
+                        fill);
+    writeChunk(dir + "/" + chunkRel, a.data.data(), a.data.size());
+    writeTextAtomic(dir + "/zarr.json", doc);
+
+    auto it = std::find_if(staticNodes_.begin(), staticNodes_.end(), [&](const auto& n) { return n.first == a.name; });
+    const bool replaced = it != staticNodes_.end();
+    if (replaced) {
+        it->second = doc;
+    }
+    else {
+        staticNodes_.emplace_back(a.name, doc);
+    }
+
+    if (groupAttributes) {
+        rootAttrs_ = jsonSetMember(*groupAttributes, "forecast_reference_time", jsonString(frt_));
+    }
+
+    // Variables published so far get grid_mapping / coordinates once latitude and longitude exist; after the
+    // finalisation every array's metadata is rewritten
+    const bool hadLatLon = hasLatLon_;
+    updateHasLatLon();
+    if (finalized_) {
+        eckit::Log::warning() << "zarr action: " << name_ << ": static array " << a.name
+                              << " arrived after the store was finalised; written, metadata rewritten" << std::endl;
+    }
+    if (finalized_ || (hasLatLon_ && !hadLatLon)) {
+        for (const auto& v : vars_) {
+            if (v.published) {
+                writeArrayMeta(v);
+            }
+        }
+    }
+    if (finalized_ && timePublished_) {
+        writeTextAtomic(root_ + "/time/zarr.json", timeJson());
+    }
+    writeConsolidated();
+
+    eckit::Log::info() << "zarr action: " << name_ << ": static array " << a.name << " " << jsonIntArray(a.shape) << " "
+                       << a.dtype << (replaced ? " (replaced)" : "")
+                       << (groupAttributes ? ", root attributes replaced" : "") << std::endl;
 }
 
 //----------------------------------------------------------------------------------------------------------------------

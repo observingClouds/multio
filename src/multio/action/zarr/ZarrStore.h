@@ -47,6 +47,17 @@ struct FieldDescription {
     std::optional<double> leadTime;  // seconds since the forecast reference time
 };
 
+/// A time-independent array sent by the client (x, y, latitude, longitude, crs, hyai, hybi): written as
+/// <name>/zarr.json plus one chunk holding the whole array, as the IAL IO server writes its static coordinates
+struct StaticArray {
+    std::string name;
+    std::vector<std::string> dims;    // outermost first; empty for a scalar
+    std::vector<std::int64_t> shape;  // same order; empty for a scalar
+    std::string dtype;                // float64 or int32
+    std::string attributes;           // compact JSON object
+    std::vector<unsigned char> data;  // little endian values, C order (last dimension fastest)
+};
+
 /// Everything a store needs to be created
 struct StoreSetup {
     std::string name;                     // store name (domain), the store is <dir>/<name>.zarr
@@ -73,6 +84,11 @@ public:
     /// A step that has already been closed is not closed again; a step without any field creates no
     /// time step (it only counts as flushed).
     void flush(std::optional<std::int64_t> step, std::optional<double> leadTime);
+
+    /// Write (or replace) a static array and, if given, replace the root group attributes (compact JSON object;
+    /// forecast_reference_time is then set to the store's reference time). The consolidated metadata is rewritten
+    /// right away; after finalisation also every array's zarr.json (with a warning).
+    void addStatic(const StaticArray& a, const std::optional<std::string>& groupAttributes);
 
     /// Rewrite every array's zarr.json with the final time length and the consolidated metadata.
     /// Data of steps that have not been flushed is discarded.
@@ -131,6 +147,7 @@ private:
 
     void createStore(const StoreSetup& setup);
     void copyStaticArrays(const std::string& srcStore);
+    void updateHasLatLon();
 
     std::size_t variableIndex(const FieldDescription& fd);
     int axisIndex(char letter);
@@ -157,11 +174,12 @@ private:
     Layout layout_;
     std::int64_t nx_ = 0;
     std::int64_t ny_ = 0;
+    std::string frt_;  // forecast reference time of the store
     std::string timeUnits_;
     std::string rootAttrs_;  // raw JSON object
     bool hasLatLon_ = false;
 
-    // Static arrays copied from the coordinates source: (name, raw zarr.json)
+    // Static arrays, copied from the coordinates source or sent by the client: (name, raw zarr.json)
     std::vector<std::pair<std::string, std::string>> staticNodes_;
     std::vector<Node> nodes_;  // order of the generated nodes in the consolidated metadata
     bool timePublished_ = false;

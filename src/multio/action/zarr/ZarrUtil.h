@@ -53,6 +53,15 @@ std::string jsonUnquote(std::string_view raw);
 /// Raw text of member `key` of a JSON object, empty if absent
 std::string jsonMember(std::string_view raw, std::string_view key);
 
+/// Strictly validated, compact copy of a JSON document that must be one object: whitespace outside strings is
+/// removed, strings and numbers are kept verbatim (no number reformatting). Throws eckit::UserError (with `what`
+/// in the message) if `raw` is not exactly one well-formed JSON object.
+std::string jsonCompactObject(std::string_view raw, const std::string& what);
+
+/// JSON object `obj` (compact) with member `key` set to the raw JSON value `value`: replaced in place if
+/// present, appended at the end otherwise
+std::string jsonSetMember(std::string_view obj, const std::string& key, const std::string& value);
+
 //----------------------------------------------------------------------------------------------------------------------
 // File system
 

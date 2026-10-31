@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <iostream>
 #include <iterator>
 #include <sstream>
@@ -350,6 +352,11 @@ ZarrStore& Zarr::store(const std::string& domain, const Message& msg) {
 void Zarr::field(const Message& msg) {
     const auto& md = msg.metadata();
 
+    if (mdBool(md, "zarr-static").value_or(false)) {
+        staticArray(msg);
+        return;
+    }
+
     auto domain = mdString(md, "domain");
     if (!domain || domain->empty()) {
         throw eckit::UserError("zarr action: field without 'domain' (the store name)", Here());
@@ -510,6 +517,130 @@ void Zarr::field(const Message& msg) {
             st.addField(fd, buffer_.data(), n);
         }
     });
+}
+
+void Zarr::staticArray(const Message& msg) {
+    const auto& md = msg.metadata();
+
+    auto domain = mdString(md, "domain");
+    if (!domain || domain->empty()) {
+        throw eckit::UserError("zarr action: static array without 'domain' (the store name)", Here());
+    }
+    StaticArray a;
+    a.name = trim(mdString(md, "name").value_or(""));
+    const std::string label = "static array '" + a.name + "' of domain " + *domain;
+    if (a.name.empty()) {
+        throw eckit::UserError("zarr action: " + label + ": no 'name'", Here());
+    }
+
+    // comma-separated lists, outermost first; an empty (or absent) string is a scalar
+    auto split = [](const std::string& s) {
+        std::vector<std::string> out;
+        if (trim(s).empty()) {
+            return out;
+        }
+        std::size_t b = 0;
+        while (true) {
+            std::size_t e = s.find(',', b);
+            out.push_back(trim(s.substr(b, e == std::string::npos ? std::string::npos : e - b)));
+            if (e == std::string::npos) {
+                break;
+            }
+            b = e + 1;
+        }
+        return out;
+    };
+    a.dims = split(mdString(md, "zarr-dimensions").value_or(""));
+    for (const auto& e : split(mdString(md, "zarr-shape").value_or(""))) {
+        std::size_t pos = 0;
+        long long v = -1;
+        try {
+            v = std::stoll(e, &pos);
+        }
+        catch (...) {
+            pos = 0;
+        }
+        if (e.empty() || pos != e.size()) {
+            throw eckit::UserError("zarr action: " + label + ": zarr-shape '" + mdString(md, "zarr-shape").value_or("")
+                                       + "' is not a comma-separated list of integers",
+                                   Here());
+        }
+        a.shape.push_back(static_cast<std::int64_t>(v));
+    }
+    a.dtype = trim(mdString(md, "zarr-dtype").value_or(""));
+    if (a.dtype != "float64" && a.dtype != "int32") {
+        throw eckit::UserError("zarr action: " + label + ": unknown zarr-dtype '" + a.dtype + "' (float64 or int32)",
+                               Here());
+    }
+    a.attributes = jsonCompactObject(mdString(md, "zarr-attributes").value_or("{}"), label + ", zarr-attributes");
+    std::optional<std::string> groupAttrs;
+    if (auto g = mdString(md, "zarr-group-attributes"); g && !trim(*g).empty()) {
+        groupAttrs = jsonCompactObject(*g, label + ", zarr-group-attributes");
+    }
+
+    // Payload: shape product == number of values == misc-globalSize
+    std::int64_t count = 1;
+    for (auto n : a.shape) {
+        count *= n;
+    }
+    util::PrecisionTag prec = util::PrecisionTag::Double;
+    if (auto p = mdString(md, "misc-precision"); p) {
+        prec = util::decodePrecisionTag(*p);
+    }
+    std::vector<double> values;
+    util::dispatchPrecisionTag(prec, [&](auto pt) {
+        using Precision = typename decltype(pt)::type;
+        if (msg.payload().size() % sizeof(Precision) != 0) {
+            std::ostringstream oss;
+            oss << "zarr action: " << label << ": payload of " << msg.payload().size() << " bytes is not a multiple of "
+                << sizeof(Precision) << " (misc-precision)";
+            throw eckit::UserError(oss.str(), Here());
+        }
+        const std::size_t n = msg.payload().size() / sizeof(Precision);
+        const auto* in = static_cast<const Precision*>(msg.payload().data());
+        values.assign(in, in + n);
+    });
+    const auto globalSize = mdInt(md, "misc-globalSize");
+    if (static_cast<std::int64_t>(values.size()) != count || (globalSize && *globalSize != count)) {
+        std::ostringstream oss;
+        oss << "zarr action: " << label << ": shape [" << mdString(md, "zarr-shape").value_or("") << "] has " << count
+            << " values, the payload has " << values.size();
+        if (globalSize) {
+            oss << ", misc-globalSize is " << *globalSize;
+        }
+        throw eckit::UserError(oss.str(), Here());
+    }
+    if (a.dtype == "float64") {
+        a.data.resize(values.size() * sizeof(double));
+        std::memcpy(a.data.data(), values.data(), a.data.size());
+    }
+    else {
+        std::vector<std::int32_t> iv(values.size());
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            const double v = values[i];
+            if (!(v == std::trunc(v)) || v < static_cast<double>(std::numeric_limits<std::int32_t>::min())
+                || v > static_cast<double>(std::numeric_limits<std::int32_t>::max())) {
+                std::ostringstream oss;
+                oss << "zarr action: " << label << ": value " << v << " at index " << i << " is not an int32";
+                throw eckit::UserError(oss.str(), Here());
+            }
+            iv[i] = static_cast<std::int32_t>(v);
+        }
+        a.data.resize(iv.size() * sizeof(std::int32_t));
+        std::memcpy(a.data.data(), iv.data(), a.data.size());
+    }
+
+    // Store (created from geometry-nx/-ny like for a field); the message's grid must be the store's
+    ZarrStore& st = store(*domain, msg);
+    const auto gnx = mdInt(md, "geometry-nx");
+    const auto gny = mdInt(md, "geometry-ny");
+    if ((gnx && *gnx != st.nx()) || (gny && *gny != st.ny())) {
+        std::ostringstream oss;
+        oss << "zarr action: " << label << " has geometry " << gnx.value_or(st.nx()) << " x " << gny.value_or(st.ny())
+            << ", but store " << st.name() << " is " << st.nx() << " x " << st.ny();
+        throw eckit::UserError(oss.str(), Here());
+    }
+    st.addStatic(a, groupAttrs);
 }
 
 void Zarr::flush(const Message& msg) {

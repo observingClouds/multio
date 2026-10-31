@@ -11,6 +11,7 @@
 #include "ZarrUtil.h"
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -298,6 +299,243 @@ std::string jsonMember(std::string_view raw, std::string_view key) {
         }
     }
     return {};
+}
+
+namespace {
+
+/// Recursive-descent JSON validator that copies the document without insignificant whitespace
+class JsonCompactor {
+public:
+    JsonCompactor(std::string_view s, const std::string& what) : s_(s), what_(what) { out_.reserve(s.size()); }
+
+    std::string object() {
+        ws();
+        if (pos_ >= s_.size() || s_[pos_] != '{') {
+            fail("a JSON object is expected");
+        }
+        value(0);
+        ws();
+        if (pos_ != s_.size()) {
+            fail("trailing characters after the object");
+        }
+        return std::move(out_);
+    }
+
+private:
+    [[noreturn]] void fail(const std::string& why) const {
+        std::ostringstream oss;
+        oss << "zarr action: " << what_ << ": malformed JSON, " << why << " at offset " << pos_;
+        throw eckit::UserError(oss.str(), Here());
+    }
+
+    void ws() {
+        while (pos_ < s_.size() && (s_[pos_] == ' ' || s_[pos_] == '\n' || s_[pos_] == '\r' || s_[pos_] == '\t')) {
+            ++pos_;
+        }
+    }
+
+    bool isDig(char c) const { return c >= '0' && c <= '9'; }
+
+    void string() {
+        // s_[pos_] == '"'
+        std::size_t b = pos_++;
+        while (pos_ < s_.size()) {
+            unsigned char c = static_cast<unsigned char>(s_[pos_]);
+            if (c == '"') {
+                ++pos_;
+                out_.append(s_.substr(b, pos_ - b));
+                return;
+            }
+            if (c < 0x20) {
+                fail("control character in a string");
+            }
+            if (c == '\\') {
+                if (pos_ + 1 >= s_.size()) {
+                    break;
+                }
+                char e = s_[pos_ + 1];
+                if (e == 'u') {
+                    if (pos_ + 5 >= s_.size()) {
+                        break;
+                    }
+                    for (std::size_t k = pos_ + 2; k < pos_ + 6; ++k) {
+                        if (!std::isxdigit(static_cast<unsigned char>(s_[k]))) {
+                            fail("bad \\u escape");
+                        }
+                    }
+                    pos_ += 6;
+                    continue;
+                }
+                if (std::string_view("\"\\/bfnrt").find(e) == std::string_view::npos) {
+                    fail("bad escape");
+                }
+                pos_ += 2;
+                continue;
+            }
+            ++pos_;
+        }
+        fail("unterminated string");
+    }
+
+    void number() {
+        std::size_t b = pos_;
+        if (s_[pos_] == '-') {
+            ++pos_;
+        }
+        if (pos_ >= s_.size() || !isDig(s_[pos_])) {
+            fail("bad number");
+        }
+        if (s_[pos_] == '0') {
+            ++pos_;
+        }
+        else {
+            while (pos_ < s_.size() && isDig(s_[pos_])) {
+                ++pos_;
+            }
+        }
+        if (pos_ < s_.size() && s_[pos_] == '.') {
+            ++pos_;
+            if (pos_ >= s_.size() || !isDig(s_[pos_])) {
+                fail("bad number");
+            }
+            while (pos_ < s_.size() && isDig(s_[pos_])) {
+                ++pos_;
+            }
+        }
+        if (pos_ < s_.size() && (s_[pos_] == 'e' || s_[pos_] == 'E')) {
+            ++pos_;
+            if (pos_ < s_.size() && (s_[pos_] == '+' || s_[pos_] == '-')) {
+                ++pos_;
+            }
+            if (pos_ >= s_.size() || !isDig(s_[pos_])) {
+                fail("bad number");
+            }
+            while (pos_ < s_.size() && isDig(s_[pos_])) {
+                ++pos_;
+            }
+        }
+        out_.append(s_.substr(b, pos_ - b));
+    }
+
+    void literal(std::string_view lit) {
+        if (s_.substr(pos_, lit.size()) != lit) {
+            fail("unexpected character");
+        }
+        out_.append(lit);
+        pos_ += lit.size();
+    }
+
+    void value(int depth) {
+        if (depth > 64) {
+            fail("nesting too deep");
+        }
+        ws();
+        if (pos_ >= s_.size()) {
+            fail("unexpected end");
+        }
+        char c = s_[pos_];
+        if (c == '{' || c == '[') {
+            const bool obj = c == '{';
+            const char close = obj ? '}' : ']';
+            out_.push_back(c);
+            ++pos_;
+            ws();
+            if (pos_ < s_.size() && s_[pos_] == close) {
+                out_.push_back(close);
+                ++pos_;
+                return;
+            }
+            while (true) {
+                ws();
+                if (obj) {
+                    if (pos_ >= s_.size() || s_[pos_] != '"') {
+                        fail("member name expected");
+                    }
+                    string();
+                    ws();
+                    if (pos_ >= s_.size() || s_[pos_] != ':') {
+                        fail("':' expected");
+                    }
+                    out_.push_back(':');
+                    ++pos_;
+                }
+                value(depth + 1);
+                ws();
+                if (pos_ >= s_.size()) {
+                    fail("unterminated container");
+                }
+                if (s_[pos_] == ',') {
+                    out_.push_back(',');
+                    ++pos_;
+                    continue;
+                }
+                if (s_[pos_] == close) {
+                    out_.push_back(close);
+                    ++pos_;
+                    return;
+                }
+                fail("',' or end of container expected");
+            }
+        }
+        if (c == '"') {
+            string();
+        }
+        else if (c == '-' || isDig(c)) {
+            number();
+        }
+        else if (c == 't') {
+            literal("true");
+        }
+        else if (c == 'f') {
+            literal("false");
+        }
+        else if (c == 'n') {
+            literal("null");
+        }
+        else {
+            fail("unexpected character");
+        }
+    }
+
+    std::string_view s_;
+    const std::string& what_;
+    std::size_t pos_ = 0;
+    std::string out_;
+};
+
+}  // namespace
+
+std::string jsonCompactObject(std::string_view raw, const std::string& what) {
+    return JsonCompactor(raw, what).object();
+}
+
+std::string jsonSetMember(std::string_view obj, const std::string& key, const std::string& value) {
+    std::string out = "{";
+    bool found = false;
+    for (const auto& m : jsonObjectMembers(obj)) {
+        if (out.size() > 1) {
+            out.push_back(',');
+        }
+        out += jsonString(m.first);
+        out.push_back(':');
+        if (m.first == key) {
+            out += value;
+            found = true;
+        }
+        else {
+            out += m.second;
+        }
+    }
+    if (!found) {
+        if (out.size() > 1) {
+            out.push_back(',');
+        }
+        out += jsonString(key);
+        out.push_back(':');
+        out += value;
+    }
+    out.push_back('}');
+    return out;
 }
 
 //----------------------------------------------------------------------------------------------------------------------

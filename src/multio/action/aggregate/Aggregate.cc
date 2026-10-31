@@ -11,6 +11,9 @@
 #include "Aggregate.h"
 
 #include <algorithm>
+#include <cctype>
+#include <string>
+#include <type_traits>
 
 #include "multio/LibMultio.h"
 #include "multio/domain/Mappings.h"
@@ -19,9 +22,50 @@ namespace multio::action::aggregate {
 
 using message::Peer;
 
+namespace {
+
+/// Metadata key `skipAggregation` true: the field is complete already (e.g. static coordinates sent by one client
+/// task) and is passed on unchanged. Accepted as bool, integer (non-zero), real (non-zero) or string
+/// (true/1/yes/t/.true., case-insensitive).
+bool skipAggregation(const Message& msg) {
+    const auto& md = msg.metadata();
+    auto it = md.find(std::string("skipAggregation"));
+    if (it == md.end()) {
+        return false;
+    }
+    return it->second.visit([](const auto& v) -> bool {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, bool>) {
+            return v;
+        }
+        else if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double> || std::is_same_v<T, float>) {
+            return v != 0;
+        }
+        else if constexpr (std::is_same_v<T, std::string>) {
+            std::string s;
+            for (char c : v) {
+                if (!std::isspace(static_cast<unsigned char>(c))) {
+                    s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                }
+            }
+            return s == "true" || s == "1" || s == "yes" || s == "t" || s == ".true.";
+        }
+        else {
+            return false;
+        }
+    });
+}
+
+}  // namespace
+
 Aggregate::Aggregate(const ComponentConfiguration& compConf) : ChainedAction(compConf) {}
 
 void Aggregate::executeImpl(Message msg) {
+
+    if ((msg.tag() == Message::Tag::Field) && skipAggregation(msg)) {
+        executeNext(std::move(msg));
+        return;
+    }
 
     if ((msg.tag() == Message::Tag::Field) && handleField(msg)) {
         executeNext(globalField(msg.fieldId()));

@@ -26,6 +26,12 @@
 /// field carries geometry-nx-full, geometry-ny-full, geometry-x0, geometry-y0, the full nx_full*ny_full grid
 /// (C order, index (j-1)*nx_full+(i-1)) of which only the nx x ny window at the 1-based offset (x0, y0) is
 /// written (IAL FullPos: the C+I zone of the C+I+E grid).
+///
+/// Static arrays: a Field message with `zarr-static` true carries one time-independent array (x, y, latitude,
+/// longitude, crs, hyai, hybi of the IAL IO-server layout) described by `name`, `zarr-dimensions`, `zarr-shape`
+/// (comma-separated, outermost first, empty for a scalar), `zarr-dtype` (float64 or int32), `zarr-attributes`
+/// (JSON object) and optionally `zarr-group-attributes` (JSON object, replaces the root attributes). It is written
+/// as <name>/zarr.json plus one chunk with the whole array and replaces an array of the same name.
 
 #pragma once
 
@@ -52,6 +58,7 @@ private:
     void print(std::ostream& os) const override;
 
     void field(const Message& msg);
+    void staticArray(const Message& msg);
     void flush(const Message& msg);
 
     ZarrStore& store(const std::string& domain, const Message& msg);
