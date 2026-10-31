@@ -21,6 +21,7 @@
 #include <cstring>
 #include <functional>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -35,6 +36,7 @@
 
 #include "eckit/testing/Test.h"
 
+#include "multio/action/zarr/ZarrUtil.h"
 #include "multio/domain/Mappings.h"
 #include "multio/message/Message.h"
 #include "multio/message/Metadata.h"
@@ -297,7 +299,7 @@ Message flushMessage(const std::string& domain, std::int64_t step, const std::st
 std::string planJson(const std::string& path, const std::string& layout, const std::string& coords) {
     std::ostringstream oss;
     oss << R"({"name": "ial-to-zarr", "actions": [)"
-        << R"({"type": "select", "match": [{"category": ["ial-field"]}]},)"
+        << R"({"type": "select", "match": [{"category": ["ial-field", "ial-static"]}]},)"
         << R"({"type": "aggregate"},)"
         << R"({"type": "zarr", "path": ")" << path << R"(", "format": 3, "layout": ")" << layout << R"(")";
     if (!coords.empty()) {
@@ -859,6 +861,457 @@ CASE("payload size, crop window and flush errors") {
     // close-connection after end-of-simulation: nothing changes
     EXPECT_NO_THROW(env.process(flush("global", std::nullopt, "close-connection")));
     EXPECT(readText(s / "time" / "zarr.json").find("\"shape\":[2]") != std::string::npos);
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// Static arrays sent by the client (zarr-static, skipAggregation): x, y, latitude, longitude, crs, hyai, hybi and
+// the root group attributes, sent by one client task through select -> aggregate -> zarr
+
+constexpr std::int64_t NHYI = 4;
+// sent with whitespace, written compact; the numbers keep their (Fortran) formatting
+const std::string CRS_ATTRS_SENT
+    = R"({ "grid_mapping_name": "lambert_conformal_conic", "earth_radius": 6.3712290000000000E+006,
+          "standard_parallel": 5.1966999999999999E+001 })";
+const std::string CRS_ATTRS
+    = R"({"grid_mapping_name":"lambert_conformal_conic","earth_radius":6.3712290000000000E+006,"standard_parallel":5.1966999999999999E+001})";
+const std::string X_ATTRS = R"({"standard_name":"projection_x_coordinate","units":"m","axis":"X"})";
+const std::string Y_ATTRS = R"({"standard_name":"projection_y_coordinate","units":"m","axis":"Y"})";
+const std::string LAT_ATTRS = R"({"standard_name":"latitude","units":"degrees_north"})";
+const std::string LON_ATTRS = R"({"standard_name":"longitude","units":"degrees_east"})";
+const std::string HYAI_ATTRS = R"({"long_name":"hybrid A coefficient at half levels","units":"Pa"})";
+const std::string HYBI_ATTRS = R"({"long_name":"hybrid B coefficient at half levels","units":"1"})";
+// the client's root attributes; forecast_reference_time is overwritten with the store's reference time
+const std::string GROUP_ATTRS_SENT
+    = R"J({"Conventions": "CF-1.8", "title": "IAL output, domain STAT", "source": "IAL MultIO client (prototype)",
+         "forecast_reference_time": "1999-12-31T00:00:00", "nx_ci": 5, "ny_ci": 4, "dx_m": 2.5000000000000000E+003})J";
+const std::string GROUP_ATTRS
+    = R"J({"Conventions":"CF-1.8","title":"IAL output, domain STAT","source":"IAL MultIO client (prototype)","forecast_reference_time":")J"
+    + FRT + R"(","nx_ci":5,"ny_ci":4,"dx_m":2.5000000000000000E+003})";
+
+/// Static values; `variant` changes the values (replacement / repetition tests). The python check has the same formulas.
+std::vector<double> staticValues(const std::string& name, int variant = 0) {
+    std::vector<double> v;
+    if (name == "x") {
+        for (int i = 0; i < NX; ++i) {
+            v.push_back(-5000.0 + 2500.0 * i + variant);
+        }
+    }
+    else if (name == "y") {
+        for (int j = 0; j < NY; ++j) {
+            v.push_back(-3750.0 + 2500.0 * j + variant);
+        }
+    }
+    else if (name == "latitude" || name == "longitude") {
+        for (int j = 0; j < NY; ++j) {
+            for (int i = 0; i < NX; ++i) {
+                v.push_back(name == "latitude" ? 51.0 + 0.0225 * j + 1.0e-4 * i + variant
+                                               : 4.9 + 0.0361 * i - 2.0e-4 * j + variant);
+            }
+        }
+    }
+    else if (name == "crs") {
+        v.push_back(0.0);
+    }
+    else if (name == "hyai" || name == "hybi") {
+        for (int k = 0; k < NHYI; ++k) {
+            v.push_back(name == "hyai" ? 1000.0 * k * (NHYI - 1 - k) : static_cast<double>(k) / (NHYI - 1));
+        }
+    }
+    return v;
+}
+
+struct StaticSpec {
+    std::string name, dims, shape, dtype, attrs, attrsSent;
+};
+
+const std::vector<StaticSpec> STATICS = {
+    {"x", "x", "5", "float64", X_ATTRS, X_ATTRS},
+    {"y", "y", "4", "float64", Y_ATTRS, Y_ATTRS},
+    {"latitude", "y,x", "4,5", "float64", LAT_ATTRS, LAT_ATTRS},
+    {"longitude", "y,x", "4,5", "float64", LON_ATTRS, LON_ATTRS},
+    {"crs", "", "", "int32", CRS_ATTRS, CRS_ATTRS_SENT},
+    {"hyai", "nhyi", "4", "float64", HYAI_ATTRS, HYAI_ATTRS},
+    {"hybi", "nhyi", "4", "float64", HYBI_ATTRS, HYBI_ATTRS},
+};
+
+const StaticSpec& staticSpec(const std::string& name) {
+    return *std::find_if(STATICS.begin(), STATICS.end(), [&](const auto& s) { return s.name == name; });
+}
+
+/// A static message as the IAL client sends it (task 1 only); md overrides for the error tests
+Message staticMessage(const std::string& domain, const std::string& name, const std::string& dims,
+                      const std::string& shape, const std::string& dtype, const std::string& attrs,
+                      const std::vector<double>& vals, const std::string& groupAttrs = "",
+                      const std::function<void(Metadata&)>& tweak = {}) {
+    Metadata md;
+    md.set("category", std::string("ial-static"));
+    md.set("domain", domain);
+    md.set("name", name);
+    md.set("skipAggregation", true);
+    md.set("zarr-static", true);
+    md.set("zarr-dimensions", dims);
+    md.set("zarr-shape", shape);
+    md.set("zarr-dtype", dtype);
+    md.set("zarr-attributes", attrs);
+    if (!groupAttrs.empty()) {
+        md.set("zarr-group-attributes", groupAttrs);
+    }
+    md.set("geometry-nx", NX);
+    md.set("geometry-ny", NY);
+    md.set("forecastReferenceTime", FRT);
+    md.set("misc-precision", std::string("double"));
+    md.set("misc-globalSize", static_cast<std::int64_t>(vals.size()));
+    if (tweak) {
+        tweak(md);
+    }
+    return Message{Message::Header{Message::Tag::Field, CLIENTS[0], SERVER, std::move(md)},
+                   eckit::Buffer(vals.data(), vals.size() * sizeof(double))};
+}
+
+Message staticMessage(const std::string& domain, const std::string& name, int variant = 0,
+                      const std::string& groupAttrs = "", const std::function<void(Metadata&)>& tweak = {}) {
+    const auto& sp = staticSpec(name);
+    return staticMessage(domain, sp.name, sp.dims, sp.shape, sp.dtype, sp.attrsSent, staticValues(name, variant),
+                         groupAttrs, tweak);
+}
+
+void sendStatics(MultioTestEnvironment& env, const std::string& domain, const std::vector<std::string>& names,
+                 int variant = 0) {
+    for (const auto& n : names) {
+        // x carries the root attributes; skipAggregation leniently as bool / int / string
+        env.process(staticMessage(domain, n, variant, n == "x" ? GROUP_ATTRS_SENT : "", [&](Metadata& md) {
+            if (n == "y") {
+                md.set("skipAggregation", std::int64_t{1});
+            }
+            if (n == "latitude") {
+                md.set("skipAggregation", std::string("true"));
+            }
+        }));
+    }
+}
+
+/// zarr.json the IO server writes for a static array (member order of ZARR_STORE_ARRAY_META)
+std::string expectedStaticDoc(const std::string& name) {
+    const auto& sp = staticSpec(name);
+    std::string dims;
+    if (!sp.dims.empty()) {
+        dims = "[\"" + sp.dims + "\"]";
+        auto c = dims.find(',');
+        if (c != std::string::npos) {
+            dims.replace(c, 1, "\",\"");
+        }
+    }
+    const std::string shape = "[" + sp.shape + "]";
+    return arrayDoc(shape, shape, sp.dtype, sp.attrs, dims, sp.dtype == "int32" ? "0" : "\"NaN\"");
+}
+
+std::string staticChunk(const std::string& name) {
+    const auto& sp = staticSpec(name);
+    std::string c = "c";
+    if (!sp.shape.empty()) {
+        c += "/0";
+        if (sp.shape.find(',') != std::string::npos) {
+            c += "/0";
+        }
+    }
+    return c;
+}
+
+/// Exact files of a static array: zarr.json byte-identical to the IO-server layout, one chunk with the values
+void checkStaticFiles(const Path& s, const std::string& name, int variant = 0) {
+    const auto& sp = staticSpec(name);
+    EXPECT_EQUAL(readText(s / name / "zarr.json"), expectedStaticDoc(name));
+    const Path chunk = s / name / staticChunk(name);
+    EXPECT(exists(chunk));
+    const auto vals = staticValues(name, variant);
+    std::string expect;
+    if (sp.dtype == "int32") {
+        std::vector<std::int32_t> iv(vals.begin(), vals.end());
+        expect.assign(reinterpret_cast<const char*>(iv.data()), iv.size() * 4);
+    }
+    else {
+        expect.assign(reinterpret_cast<const char*>(vals.data()), vals.size() * 8);
+    }
+    EXPECT(readText(chunk) == expect);
+    // the consolidated root holds the same document
+    EXPECT(readText(s / "zarr.json").find("\"" + name + "\":" + expectedStaticDoc(name)) != std::string::npos);
+}
+
+std::string rootAttributes(const Path& s) {
+    return multio::action::zarr::jsonMember(readText(s / "zarr.json"), "attributes");
+}
+
+std::vector<std::string> consolidatedNames(const Path& s) {
+    namespace z = multio::action::zarr;
+    std::vector<std::string> names;
+    for (const auto& m : z::jsonObjectMembers(z::jsonMember(z::jsonMember(readText(s / "zarr.json"), "consolidated_metadata"), "metadata"))) {
+        names.push_back(m.first);
+    }
+    return names;
+}
+
+const std::vector<std::string> ALL_STATICS = {"x", "y", "latitude", "longitude", "crs", "hyai", "hybi"};
+
+CASE("static arrays before the fields (no coordinates-from)") {
+    const std::string domain = "STATDOM";
+    const Path out = absolute(outRoot()) / "static-before";
+    removeAll(out);
+    registerDomain(domain);
+    {
+        auto env = MultioTestEnvironment(planJson(out.string(), "chunk-per-level", ""));
+        sendStatics(env, domain, ALL_STATICS);  // creates the store
+        const Path s = out / (domain + ".zarr");
+        // consolidated root rewritten right after each static array, root attributes replaced
+        EXPECT(consolidatedNames(s) == ALL_STATICS);
+        EXPECT_EQUAL(rootAttributes(s), GROUP_ATTRS);
+        runSteps(env, domain, "end-of-simulation");
+    }
+    const Path s = out / (domain + ".zarr");
+    for (const auto& n : ALL_STATICS) {
+        checkStaticFiles(s, n);
+    }
+    EXPECT_EQUAL(fileSize(s / "latitude" / "c" / "0" / "0"), static_cast<std::uintmax_t>(NPTS * 8));
+    EXPECT_EQUAL(fileSize(s / "crs" / "c"), 4u);
+    EXPECT_EQUAL(rootAttributes(s), GROUP_ATTRS);
+    auto names = consolidatedNames(s);
+    EXPECT(names.size() > ALL_STATICS.size()
+           && std::vector<std::string>(names.begin(), names.begin() + ALL_STATICS.size()) == ALL_STATICS);
+    const std::string tdoc = readText(s / "S_TEMPERATURE" / "zarr.json");
+    EXPECT(tdoc.find("\"grid_mapping\":\"crs\",\"coordinates\":\"latitude longitude\"") != std::string::npos);
+    EXPECT(tdoc.find("\"shape\":[3,3,4,5]") != std::string::npos);
+    checkLevelChunk(readFloats(s / "S_TEMPERATURE" / "c" / "2" / "2" / "0" / "0"), 1, 96, 3);
+}
+
+CASE("static arrays after the fields, repeated, after finalisation") {
+    const std::string domain = "STATLATE";
+    const Path out = absolute(outRoot()) / "static-after";
+    removeAll(out);
+    registerDomain(domain);
+    const Path s = out / (domain + ".zarr");
+    {
+        auto env = MultioTestEnvironment(planJson(out.string(), "shard-levels", ""));
+        for (std::size_t t = 0; t < STEPS.size(); ++t) {
+            const auto step = STEPS[t];
+            for (const auto& v : VARS) {
+                if (t < v.firstTime) {
+                    continue;
+                }
+                for (auto lev : v.levels.empty() ? std::vector<std::int64_t>{0} : v.levels) {
+                    for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                        env.process(fieldMessage(domain, v, step, lev, c));
+                    }
+                }
+            }
+            if (t == 1) {
+                // x, y, crs between the fields and the flush of step 48; latitude only: no grid_mapping yet
+                sendStatics(env, domain, {"x", "y", "crs", "latitude"});
+                EXPECT(readText(s / "SURFTEMPERATURE" / "zarr.json").find("grid_mapping") == std::string::npos);
+                EXPECT(readText(s / "zarr.json").find("\"grid_mapping\"") == std::string::npos);
+                // longitude: published arrays get grid_mapping / coordinates right away
+                sendStatics(env, domain, {"longitude"});
+                EXPECT(readText(s / "SURFTEMPERATURE" / "zarr.json").find("\"grid_mapping\":\"crs\"")
+                       != std::string::npos);
+                EXPECT(readText(s / "zarr.json").find("\"grid_mapping\":\"crs\"") != std::string::npos);
+                // a repeated static array is overwritten (idempotent), different values replace
+                sendStatics(env, domain, {"x"}, 1);
+                sendStatics(env, domain, {"x"});
+            }
+            const std::string kind = (t + 1 == STEPS.size()) ? "end-of-simulation" : "step";
+            for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                env.process(flushMessage(domain, step, kind, c));
+            }
+            if (t == 0) {
+                EXPECT(readText(s / "SURFTEMPERATURE" / "zarr.json").find("grid_mapping") == std::string::npos);
+                EXPECT(rootAttributes(s).find("MultIO zarr output") != std::string::npos);
+            }
+        }
+        // after the end-of-simulation flush: written, metadata rewritten (with a warning)
+        sendStatics(env, domain, {"hyai", "hybi"});
+        EXPECT(readText(s / "S_TEMPERATURE" / "zarr.json").find("\"shape\":[3,3,4,5]") != std::string::npos);
+        // root attributes without forecast_reference_time: it is appended
+        env.process(staticMessage(domain, "x", 0, R"({"Conventions":"CF-1.8","title":"late"})"));
+        EXPECT_EQUAL(rootAttributes(s),
+                     std::string(R"({"Conventions":"CF-1.8","title":"late","forecast_reference_time":")") + FRT + "\"}");
+        env.process(staticMessage(domain, "x", 0, GROUP_ATTRS_SENT));
+    }
+    for (const auto& n : ALL_STATICS) {
+        checkStaticFiles(s, n);
+    }
+    EXPECT_EQUAL(rootAttributes(s), GROUP_ATTRS);
+    auto names = consolidatedNames(s);
+    EXPECT_EQUAL(std::count(names.begin(), names.end(), std::string("x")), 1);
+    EXPECT(std::find(names.begin(), names.end(), "hybi") != names.end());
+    const std::string tdoc = readText(s / "S_TEMPERATURE" / "zarr.json");
+    EXPECT(tdoc.find("\"grid_mapping\":\"crs\"") != std::string::npos);
+    EXPECT(tdoc.find("\"shape\":[3,3,4,5]") != std::string::npos);
+    EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=96 time_index=2 inc=0002:00:00\n"));
+}
+
+CASE("static arrays replace arrays copied by coordinates-from") {
+    const std::string domain = "STATCOPY";
+    const Path root = absolute(outRoot());
+    const Path out = root / "static-replace";
+    const Path coords = root / "coords-static";
+    removeAll(out);
+    writeCoordinateStore(coords, domain);
+    registerDomain(domain);
+    const Path s = out / (domain + ".zarr");
+    {
+        auto env = MultioTestEnvironment(planJson(out.string(), "chunk-per-level", coords.string()));
+        runSteps(env, domain, "step");
+        // copied: x, y, latitude, longitude, crs and the copy's root attributes
+        EXPECT(rootAttributes(s).find("selftest coordinates") != std::string::npos);
+        EXPECT(consolidatedNames(s)[0] == "x");
+        // a stale chunk of the copied array must not survive the replacement
+        writeText(s / "latitude" / "c" / "9" / "9", "stale");
+        sendStatics(env, domain, {"latitude", "x"});
+        EXPECT(!exists(s / "latitude" / "c" / "9" / "9"));
+        env.process(flushMessage(domain, 96, "end-of-simulation", 0));
+        env.process(flushMessage(domain, 96, "end-of-simulation", 1));
+    }
+    checkStaticFiles(s, "x");
+    checkStaticFiles(s, "latitude");
+    EXPECT_EQUAL(rootAttributes(s), GROUP_ATTRS);  // replaced, dx_m of the copy gone
+    // replaced in place: order of the copy kept, no duplicates; y, longitude, crs still the copied ones
+    auto names = consolidatedNames(s);
+    EXPECT(std::vector<std::string>(names.begin(), names.begin() + 5)
+           == (std::vector<std::string>{"x", "y", "latitude", "longitude", "crs"}));
+    EXPECT_EQUAL(std::count(names.begin(), names.end(), std::string("latitude")), 1);
+    EXPECT_EQUAL(readText(s / "y" / "c" / "0").size(), static_cast<std::size_t>(NY * 8));
+    EXPECT(readText(s / "crs" / "zarr.json").find("\"earth_radius\":6.3712290000000000E+006") != std::string::npos);
+    EXPECT(readText(s / "S_TEMPERATURE" / "zarr.json").find("\"grid_mapping\":\"crs\"") != std::string::npos);
+}
+
+CASE("static array errors") {
+    const Path out = absolute(outRoot()) / "static-errors";
+    removeAll(out);
+    const std::string domain = "STATERR";
+    auto plan = std::string(R"({"name": "z", "actions": [{"type": "zarr", "path": ")") + out.string()
+              + R"(", "layout": "chunk-per-level"}]})";
+    auto env = MultioTestEnvironment(plan);
+    using Tweak = std::function<void(Metadata&)>;
+    auto msg = [&](const std::string& name, const Tweak& t) { return staticMessage(domain, name, 0, "", t); };
+    const auto lat = staticValues("latitude");
+
+    EXPECT_NO_THROW(env.process(staticMessage(domain, "x")));
+    EXPECT_NO_THROW(env.process(msg("crs", [](Metadata& md) { md.set("zarr-shape", std::string(" ")); })));
+    // shape product != payload count; misc-globalSize != shape product
+    EXPECT_THROWS(env.process(staticMessage(domain, "latitude", "y,x", "4,4", "float64", LAT_ATTRS, lat)));
+    EXPECT_THROWS(env.process(msg("latitude", [](Metadata& md) { md.set("misc-globalSize", std::int64_t{19}); })));
+    // number of dimension names != rank
+    EXPECT_THROWS(env.process(staticMessage(domain, "latitude", "y", "4,5", "float64", LAT_ATTRS, lat)));
+    EXPECT_THROWS(env.process(staticMessage(domain, "crs", "x", "", "int32", CRS_ATTRS, {0.0})));
+    // x / y must match the store's nx / ny
+    EXPECT_THROWS(env.process(staticMessage(domain, "latitude", "x,y", "4,5", "float64", LAT_ATTRS, lat)));
+    EXPECT_THROWS(env.process(staticMessage(domain, "latitude", "y,x", "5,4", "float64", LAT_ATTRS, lat)));
+    EXPECT_THROWS(env.process(staticMessage(domain, "x", "x", "4", "float64", X_ATTRS, std::vector<double>(4, 0.0))));
+    // reserved names, unknown dtype, non-integral int32, malformed JSON / shape
+    EXPECT_THROWS(env.process(staticMessage(domain, "time", "nt", "1", "float64", "{}", {0.0})));
+    EXPECT_THROWS(env.process(staticMessage(domain, "level_S", "level_S", "1", "float64", "{}", {0.0})));
+    EXPECT_THROWS(env.process(staticMessage(domain, "x", "x", "5", "float32", X_ATTRS, staticValues("x"))));
+    EXPECT_THROWS(env.process(staticMessage(domain, "crs", "", "", "int32", CRS_ATTRS, {0.5})));
+    EXPECT_THROWS(env.process(staticMessage(domain, "crs", "", "", "int32", "{\"a\":1", {0.0})));
+    EXPECT_THROWS(env.process(staticMessage(domain, "crs", "", "", "int32", "[1]", {0.0})));
+    EXPECT_THROWS(env.process(msg("x", [](Metadata& md) { md.set("zarr-group-attributes", std::string("{x}")); })));
+    EXPECT_THROWS(env.process(msg("x", [](Metadata& md) { md.set("zarr-shape", std::string("5a")); })));
+    // geometry of the message different from the store's
+    EXPECT_THROWS(env.process(msg("x", [](Metadata& md) { md.set("geometry-ny", std::int64_t{5}); })));
+    // an existing time-dependent array; and a field named like a static array
+    Metadata fmd;
+    fmd.set("domain", domain);
+    fmd.set("misc-precision", std::string("double"));
+    fmd.set("levtype", std::string("SURF"));
+    fmd.set("suffix", std::string("TEMPERATURE"));
+    fmd.set("step", std::int64_t{0});
+    fmd.set("geometry-nx", NX);
+    fmd.set("geometry-ny", NY);
+    std::vector<double> f(NPTS, 1.0);
+    EXPECT_NO_THROW(env.process(Message{Message::Header{Message::Tag::Field, SERVER, SERVER, Metadata(fmd)},
+                                        eckit::Buffer(f.data(), f.size() * sizeof(double))}));
+    EXPECT_THROWS(env.process(staticMessage(domain, "SURFTEMPERATURE", "y,x", "4,5", "float64", "{}", lat)));
+    // failed messages wrote nothing: only x, crs and the field's directory
+    const Path s = out / (domain + ".zarr");
+    EXPECT(consolidatedNames(s) == (std::vector<std::string>{"x", "crs"}));
+    EXPECT(!exists(s / "latitude"));
+    EXPECT(!exists(s / "time" / "zarr.json"));
+    checkStaticFiles(s, "x");
+    checkStaticFiles(s, "crs");
+}
+
+CASE("static arrays of the reference store, byte-identical (MULTIO_ZARR_REFERENCE_STORE)") {
+    // Optional: re-send the static arrays and root attributes of an IO-server store and compare the files byte by
+    // byte, e.g. MULTIO_ZARR_REFERENCE_STORE=.../coords/zarr_out_accord/PFDEODDOMAIN.zarr
+    const char* refEnv = std::getenv("MULTIO_ZARR_REFERENCE_STORE");
+    if (refEnv == nullptr || !exists(Path(refEnv) / "zarr.json")) {
+        std::cout << "MULTIO_ZARR_REFERENCE_STORE not set or not a store: skipped" << std::endl;
+        return;
+    }
+    namespace z = multio::action::zarr;
+    const Path ref(refEnv);
+    const std::string refRoot = readText(ref / "zarr.json");
+    const std::string refAttrs = z::jsonMember(refRoot, "attributes");
+    const std::string frt = z::jsonUnquote(z::jsonMember(refAttrs, "forecast_reference_time"));
+    const std::int64_t nx = std::stoll(z::jsonArrayElements(z::jsonMember(readText(ref / "x" / "zarr.json"), "shape"))[0]);
+    const std::int64_t ny = std::stoll(z::jsonArrayElements(z::jsonMember(readText(ref / "y" / "zarr.json"), "shape"))[0]);
+    const Path out = absolute(outRoot()) / "static-reference";
+    removeAll(out);
+    const std::string domain = "REFDOM";
+    auto plan = std::string(R"({"name": "z", "actions": [{"type": "select", "match": [{"category": ["ial-static"]}]}, {"type": "aggregate"}, {"type": "zarr", "path": ")")
+              + out.string() + R"(", "layout": "chunk-per-level"}]})";
+    {
+        auto env = MultioTestEnvironment(plan);
+        for (const auto& name : ALL_STATICS) {
+            const std::string doc = readText(ref / name / "zarr.json");
+            std::vector<std::string> dims;
+            if (const std::string dn = z::jsonMember(doc, "dimension_names"); !dn.empty()) {  // none for crs
+                for (const auto& d : z::jsonArrayElements(dn)) {
+                    dims.push_back(z::jsonUnquote(d));
+                }
+            }
+            std::vector<std::string> shape = z::jsonArrayElements(z::jsonMember(doc, "shape"));
+            auto join = [](const std::vector<std::string>& v) {
+                std::string r;
+                for (std::size_t i = 0; i < v.size(); ++i) {
+                    r += (i ? "," : "") + v[i];
+                }
+                return r;
+            };
+            const std::string dtype = z::jsonUnquote(z::jsonMember(doc, "data_type"));
+            const std::string chunk = "c" + std::string(shape.size() == 2 ? "/0/0" : shape.size() == 1 ? "/0" : "");
+            const std::string raw = readText(ref / name / chunk);
+            std::vector<double> vals;
+            if (dtype == "int32") {
+                for (std::size_t i = 0; i + 4 <= raw.size(); i += 4) {
+                    std::int32_t v;
+                    std::memcpy(&v, raw.data() + i, 4);
+                    vals.push_back(v);
+                }
+            }
+            else {
+                vals.resize(raw.size() / 8);
+                std::memcpy(vals.data(), raw.data(), vals.size() * 8);
+            }
+            env.process(staticMessage(domain, name, join(dims), join(shape), dtype, z::jsonMember(doc, "attributes"),
+                                      vals, name == "x" ? refAttrs : "", [&](Metadata& md) {
+                                          md.set("geometry-nx", nx);
+                                          md.set("geometry-ny", ny);
+                                          md.set("forecastReferenceTime", frt);
+                                      }));
+            EXPECT_EQUAL(readText(out / (domain + ".zarr") / name / "zarr.json"), doc);
+            EXPECT(readText(out / (domain + ".zarr") / name / chunk) == raw);
+            std::cout << "reference static array " << name << ": zarr.json and " << chunk << " ("
+                      << raw.size() << " bytes) identical" << std::endl;
+        }
+    }
+    const Path s = out / (domain + ".zarr");
+    EXPECT_EQUAL(rootAttributes(s), refAttrs);
+    EXPECT(consolidatedNames(s) == ALL_STATICS);
+    // the static part of the consolidated metadata equals the reference's
+    const std::string ours = z::jsonMember(z::jsonMember(readText(s / "zarr.json"), "consolidated_metadata"), "metadata");
+    const std::string theirs = z::jsonMember(z::jsonMember(refRoot, "consolidated_metadata"), "metadata");
+    for (const auto& name : ALL_STATICS) {
+        EXPECT_EQUAL(z::jsonMember(ours, name), z::jsonMember(theirs, name));
+    }
 }
 
 CASE("configuration errors") {

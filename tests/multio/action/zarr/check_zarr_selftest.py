@@ -254,6 +254,97 @@ def check_payload_errors(root):
     check(not os.path.exists(os.path.join(root, "payload-errors", "OTHERDOM.zarr")), "payload-errors: OTHERDOM")
 
 
+# --- static arrays sent by the client (TestZarr.cc "static arrays ..."): same formulas as staticValues()
+NHYI = 4
+STATIC_NAMES = ["x", "y", "latitude", "longitude", "crs", "hyai", "hybi"]
+GROUP_ATTRS = {"Conventions": "CF-1.8", "title": "IAL output, domain STAT", "source": "IAL MultIO client (prototype)",
+               "forecast_reference_time": "2025-02-09T00:00:00", "nx_ci": 5, "ny_ci": 4, "dx_m": 2500.0}
+
+
+def static_values(name):
+    if name == "x":
+        return np.array([-5000.0 + 2500.0 * i for i in range(NX)])
+    if name == "y":
+        return np.array([-3750.0 + 2500.0 * j for j in range(NY)])
+    if name == "latitude":
+        return np.array([[51.0 + 0.0225 * j + 1.0e-4 * i for i in range(NX)] for j in range(NY)])
+    if name == "longitude":
+        return np.array([[4.9 + 0.0361 * i - 2.0e-4 * j for i in range(NX)] for j in range(NY)])
+    if name == "crs":
+        return np.int32(0)
+    if name == "hyai":
+        return np.array([1000.0 * k * (NHYI - 1 - k) for k in range(NHYI)])
+    return np.array([k / (NHYI - 1) for k in range(NHYI)])
+
+
+def check_statics(path, label, names, layout_vars=True):
+    for consolidated in (True, False):
+        g = zarr.open_group(path, mode="r", use_consolidated=consolidated)
+        keys = set(g.array_keys())
+        for name in names:
+            check(name in keys, f"{label} consolidated={consolidated}: static array {name} missing")
+            if name not in keys:
+                continue
+            a = g[name]
+            e = static_values(name)
+            if name == "crs":
+                check(a.shape == () and a.dtype == np.int32 and a[...] == 0,
+                      f"{label}: crs shape {a.shape} dtype {a.dtype}")
+                check(a.attrs.get("grid_mapping_name") == "lambert_conformal_conic"
+                      and a.attrs.get("earth_radius") == 6371229.0, f"{label}: crs attrs {dict(a.attrs)}")
+                check(a.metadata.dimension_names is None, f"{label}: crs dims {a.metadata.dimension_names}")
+                check(a.metadata.fill_value == 0, f"{label}: crs fill {a.metadata.fill_value}")
+                continue
+            check(a.dtype == np.float64 and a.shape == e.shape, f"{label}: {name} {a.dtype} {a.shape}")
+            if a.shape == e.shape:
+                check(np.array_equal(a[...].view(np.uint64), e.view(np.uint64)), f"{label}: {name} values")
+            dims = {"x": ["x"], "y": ["y"], "latitude": ["y", "x"], "longitude": ["y", "x"]}.get(name, ["nhyi"])
+            check(list(a.metadata.dimension_names) == dims, f"{label}: {name} dims {a.metadata.dimension_names}")
+            check(a.chunks == a.shape, f"{label}: {name} chunks {a.chunks}")
+        check(dict(g.attrs) == GROUP_ATTRS, f"{label} consolidated={consolidated}: root attrs {dict(g.attrs)}")
+        if layout_vars:
+            for name, *_ in VARS:
+                attrs = dict(g[name].attrs)
+                check(attrs.get("grid_mapping") == "crs" and attrs.get("coordinates") == "latitude longitude",
+                      f"{label} consolidated={consolidated}: {name} grid_mapping/coordinates {attrs}")
+                check(bit_equal(g[name][...], expected(name)), f"{label} consolidated={consolidated}: {name} values")
+        ds = xr.open_zarr(path, consolidated=consolidated, zarr_format=3)
+        check("latitude" in ds.coords and "longitude" in ds.coords, f"{label} xr: coords {list(ds.coords)}")
+        check(ds.latitude.dims == ("y", "x"), f"{label} xr: latitude dims {ds.latitude.dims}")
+        if "x" in names:
+            check(np.array_equal(ds.x.values, static_values("x")), f"{label} xr: x {ds.x.values}")
+        if "hyai" in names:
+            check(ds.hyai.dims == ("nhyi",), f"{label} xr: hyai dims {ds.hyai.dims}")
+        check(ds.sizes["time"] == len(STEPS), f"{label} xr: time {ds.sizes['time']}")
+        ds.close()
+
+
+def check_static_stores(root):
+    check_statics(os.path.join(root, "static-before", "STATDOM.zarr"), "static-before", STATIC_NAMES)
+    check_statics(os.path.join(root, "static-after", "STATLATE.zarr"), "static-after", STATIC_NAMES)
+    # replacement of coordinates-from arrays: x and latitude sent, y/longitude/crs copied
+    path = os.path.join(root, "static-replace", "STATCOPY.zarr")
+    check_statics(path, "static-replace", ["x", "latitude"])
+    g = zarr.open_group(path, mode="r")
+    check(np.array_equal(g["y"][...], 2500.0 * np.arange(NY)), "static-replace: copied y")
+    check(np.array_equal(g["longitude"][...][0], 4.0 + 0.1 * np.arange(NX)), "static-replace: copied longitude")
+    check("hyai" not in set(g.array_keys()), "static-replace: hyai")
+    # the shard-levels store with late statics equals the chunk-per-level store with early ones
+    g1 = zarr.open_group(os.path.join(root, "static-before", "STATDOM.zarr"), mode="r")
+    g2 = zarr.open_group(os.path.join(root, "static-after", "STATLATE.zarr"), mode="r")
+    for name in STATIC_NAMES:
+        check(np.array_equal(np.asarray(g1[name][...]), np.asarray(g2[name][...])), f"static before/after: {name}")
+    errs = zarr.open_group(os.path.join(root, "static-errors", "STATERR.zarr"), mode="r")
+    check({"x", "crs"} <= set(errs.array_keys()) and "latitude" not in set(errs.array_keys()),
+          f"static-errors: arrays {sorted(errs.array_keys())}")
+    ref = os.path.join(root, "static-reference", "REFDOM.zarr")
+    if os.path.exists(ref):
+        g = zarr.open_group(ref, mode="r")
+        check(set(g.array_keys()) == set(STATIC_NAMES), f"static-reference: arrays {sorted(g.array_keys())}")
+        check(g["latitude"].shape == (g["y"].shape[0], g["x"].shape[0]), "static-reference: latitude shape")
+        print(f"static-reference: {sorted(g.array_keys())}, latitude {g['latitude'].shape}")
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "zarr-selftest"
     print(f"zarr {zarr.__version__} ({zarr.__file__}), xarray {xr.__version__}, numpy {np.__version__}")
@@ -288,6 +379,7 @@ def main():
     for name in {f[1] for f in FP_FIELDS}:
         check(bit_equal(g1[name][...], g2[name][...]), f"fullpos shard vs chunk: {name}")
     check_payload_errors(root)
+    check_static_stores(root)
 
     if failures:
         print(f"{len(failures)} FAILURES")
