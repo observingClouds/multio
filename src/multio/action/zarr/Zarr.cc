@@ -262,6 +262,81 @@ Layout parseLayout(const std::string& s) {
     throw eckit::UserError("zarr action: unknown layout '" + s + "' (chunk-per-level or shard-levels)", Here());
 }
 
+Codec parseCodec(const std::string& s) {
+    if (s == "none") {
+        return Codec::None;
+    }
+    if (s == "zstd") {
+        if (!zstdAvailable()) {
+            throw eckit::UserError("zarr action: compression codec zstd requested, but the zarr action was built "
+                                   "without libzstd (see MULTIO_ZARR_ZSTD in its CMakeLists.txt)",
+                                   Here());
+        }
+        return Codec::Zstd;
+    }
+    throw eckit::UserError("zarr action: unknown compression codec '" + s + "' (none or zstd)", Here());
+}
+
+/// `compression`: absent, a string (codec name) or {codec: <name>, level: <int>}
+Compression parseCompression(const eckit::LocalConfiguration& cfg) {
+    Compression c;
+    if (!cfg.has("compression") || cfg.isNull("compression")) {
+        return c;
+    }
+    if (cfg.isString("compression")) {
+        c.codec = parseCodec(cfg.getString("compression"));
+        return c;
+    }
+    if (!cfg.isSubConfiguration("compression")) {
+        throw eckit::UserError("zarr action: 'compression' must be a codec name or {codec: zstd, level: <int>}",
+                               Here());
+    }
+    const auto sub = cfg.getSubConfiguration("compression");
+    for (const auto& k : sub.keys()) {
+        if (k != "codec" && k != "level") {
+            throw eckit::UserError("zarr action: unknown key 'compression." + k + "' (codec, level)", Here());
+        }
+    }
+    if (!sub.has("codec") || !sub.isString("codec")) {
+        throw eckit::UserError("zarr action: 'compression' needs 'codec' (none or zstd)", Here());
+    }
+    c.codec = parseCodec(sub.getString("codec"));
+    if (sub.has("level")) {
+        if (!sub.isIntegral("level")) {
+            throw eckit::UserError("zarr action: 'compression.level' must be an integer", Here());
+        }
+        const long long level = sub.getLong("level");
+        if (c.codec == Codec::Zstd) {
+            const auto range = zstdLevelRange();
+            if (level < range.first || level > range.second) {
+                throw eckit::UserError("zarr action: zstd compression level " + std::to_string(level)
+                                           + " out of range [" + std::to_string(range.first) + ", "
+                                           + std::to_string(range.second) + "] (1 .. 22 usual, 3 default)",
+                                       Here());
+            }
+        }
+        c.level = static_cast<int>(level);
+    }
+    return c;
+}
+
+std::size_t parseCount(const eckit::LocalConfiguration& cfg, const std::string& key, std::size_t def,
+                       long long maximum) {
+    if (!cfg.has(key)) {
+        return def;
+    }
+    if (!cfg.isIntegral(key)) {
+        throw eckit::UserError("zarr action: '" + key + "' must be an integer", Here());
+    }
+    const long long v = cfg.getLong(key);
+    if (v < 0 || v > maximum) {
+        throw eckit::UserError("zarr action: '" + key + "' is " + std::to_string(v) + ", must be in [0, "
+                                   + std::to_string(maximum) + "]",
+                               Here());
+    }
+    return static_cast<std::size_t>(v);
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -288,11 +363,19 @@ Zarr::Zarr(const ComponentConfiguration& compConf) :
     if (cfg.has("timestep")) {
         timestep_ = cfg.getDouble("timestep");
     }
+    compression_ = parseCompression(cfg);
+    compressionThreads_ = parseCount(cfg, "compression-threads", 4, 256);
+    compressionQueue_ = parseCount(cfg, "compression-queue", 2 * compressionThreads_, 4096);
+    if (compression_.enabled() && compressionThreads_ > 0) {
+        pool_ = std::make_unique<WorkerPool>(compressionThreads_, std::max<std::size_t>(1, compressionQueue_));
+    }
     makeDirs(path_);
 }
 
 Zarr::~Zarr() {
     finalizeAll();
+    stores_.clear();  // waits for jobs of discarded steps
+    pool_.reset();    // joins the workers
 }
 
 void Zarr::finalizeAll() noexcept {
@@ -341,6 +424,8 @@ ZarrStore& Zarr::store(const std::string& domain, const Message& msg) {
     setup.dir = path_;
     setup.layout = layout_;
     setup.coordinatesFrom = coordinatesFrom_;
+    setup.compression = compression_;
+    setup.pool = pool_.get();
     setup.nx = mdInt(md, "geometry-nx");
     setup.ny = mdInt(md, "geometry-ny");
     if (auto frt = mdString(md, "forecastReferenceTime"); frt && !frt->empty()) {
@@ -492,29 +577,39 @@ void Zarr::field(const Message& msg) {
             throw eckit::UserError(oss.str(), Here());
         }
         const auto* in = static_cast<const Precision*>(msg.payload().data());
+        // With compression workers a converted / cropped field goes to a fresh vector that the job takes over
+        // (no second copy); otherwise the action's buffer is reused
+        const bool async = st.encodesAsync();
+        std::vector<float> fresh;
+        std::vector<float>& out = async ? fresh : buffer_;
         if (crop) {
-            buffer_.resize(nx * ny);
+            out.resize(nx * ny);
             const std::size_t nxFull = static_cast<std::size_t>(crop->nxFull);
             const std::size_t i0 = static_cast<std::size_t>(crop->x0 - 1);
             const std::size_t j0 = static_cast<std::size_t>(crop->y0 - 1);
             for (std::size_t j = 0; j < ny; ++j) {
                 const Precision* row = in + (j0 + j) * nxFull + i0;
-                float* out = buffer_.data() + j * nx;
+                float* o = out.data() + j * nx;
                 for (std::size_t i = 0; i < nx; ++i) {
-                    out[i] = static_cast<float>(row[i]);
+                    o[i] = static_cast<float>(row[i]);
                 }
             }
-            st.addField(fd, buffer_.data(), nx * ny);
         }
         else if constexpr (std::is_same_v<Precision, float>) {
-            st.addField(fd, in, n);
+            st.addField(fd, in, n);  // copied by the store if a worker compresses it
+            return;
         }
         else {
-            buffer_.resize(n);
+            out.resize(n);
             for (std::size_t i = 0; i < n; ++i) {
-                buffer_[i] = static_cast<float>(in[i]);
+                out[i] = static_cast<float>(in[i]);
             }
-            st.addField(fd, buffer_.data(), n);
+        }
+        if (async) {
+            st.addField(fd, std::move(fresh));
+        }
+        else {
+            st.addField(fd, out.data(), out.size());
         }
     });
 }
@@ -704,6 +799,9 @@ void Zarr::print(std::ostream& os) const {
        << ", layout=" << (layout_ == Layout::ShardLevels ? "shard-levels" : "chunk-per-level");
     if (coordinatesFrom_) {
         os << ", coordinates-from=" << *coordinatesFrom_;
+    }
+    if (compression_.enabled()) {
+        os << ", compression=" << compression_.describe() << ", compression-threads=" << compressionThreads_;
     }
     os << ", stores=" << stores_.size() << ")";
 }

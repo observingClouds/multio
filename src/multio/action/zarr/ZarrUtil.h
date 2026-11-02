@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -100,13 +101,18 @@ void renamePath(const std::string& from, const std::string& to);
 /// Remove a file, ignoring errors
 void removeFile(const std::string& path) noexcept;
 
-/// Cache of directories known to exist, to avoid repeated mkdir system calls
+/// Cache of directories known to exist, to avoid repeated mkdir system calls. Thread-safe (compression workers
+/// create chunk directories concurrently; makeDirs tolerates a concurrent mkdir of the same path).
 class DirectoryCache {
 public:
     void ensure(const std::string& dir);
-    void clear() { known_.clear(); }
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        known_.clear();
+    }
 
 private:
+    std::mutex mutex_;
     std::unordered_set<std::string> known_;
 };
 

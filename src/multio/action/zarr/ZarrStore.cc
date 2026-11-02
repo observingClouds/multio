@@ -153,11 +153,19 @@ std::vector<std::int64_t> parseShape(const std::string& raw) {
 
 //----------------------------------------------------------------------------------------------------------------------
 
-ZarrStore::ZarrStore(const StoreSetup& setup) : name_{setup.name}, layout_{setup.layout} {
+ZarrStore::ZarrStore(const StoreSetup& setup) :
+    name_{setup.name}, layout_{setup.layout}, compression_{setup.compression}, pool_{setup.pool} {
     if (!littleEndianHost()) {
         throw eckit::NotImplemented("zarr action: big endian hosts are not supported", Here());
     }
     createStore(setup);
+}
+
+ZarrStore::~ZarrStore() {
+    // the jobs refer to this store (directory cache, compression settings)
+    for (auto& o : open_) {
+        o.second.jobs->waitNoThrow();
+    }
 }
 
 void ZarrStore::createStore(const StoreSetup& setup) {
@@ -256,8 +264,8 @@ void ZarrStore::createStore(const StoreSetup& setup) {
     writeConsolidated();
 
     eckit::Log::info() << "zarr action: created store " << root_ << " (" << nx_ << " x " << ny_ << ", layout "
-                       << (layout_ == Layout::ShardLevels ? "shard-levels" : "chunk-per-level") << ", "
-                       << staticNodes_.size() << " static arrays copied)" << std::endl;
+                       << (layout_ == Layout::ShardLevels ? "shard-levels" : "chunk-per-level") << ", compression "
+                       << compression_.describe() << ", " << staticNodes_.size() << " static arrays copied)" << std::endl;
 }
 
 void ZarrStore::copyStaticArrays(const std::string& src) {
@@ -518,6 +526,7 @@ ZarrStore::OpenStep& ZarrStore::openStep(std::int64_t step) {
     OpenStep st;
     st.step = step;
     st.timeIndex = t;
+    st.jobs = std::make_shared<JobGroup>();
     return open_.emplace(t, std::move(st)).first->second;
 }
 
@@ -538,7 +547,40 @@ void ZarrStore::writeChunk(const std::string& path, const void* data, std::size_
     writeFileAtomic(path, data, nbytes);
 }
 
+void ZarrStore::encodeChunk(const std::string& path, bool ensureDir, const float* values,
+                            std::size_t nbytes) const {
+    if (ensureDir) {
+        dirs_.ensure(dirName(path));
+    }
+    if (!compression_.enabled()) {
+        writeFileAtomic(path, values, nbytes);
+        return;
+    }
+    thread_local std::vector<unsigned char> buf;  // one compression buffer per thread, kept at its capacity
+    compressInto(compression_, values, nbytes, buf);
+    writeFileAtomic(path, buf.data(), buf.size());
+}
+
 void ZarrStore::addField(const FieldDescription& fd, const float* values, std::size_t n) {
+    if (encodesAsync()) {
+        addFieldImpl(fd, values, n, std::make_shared<const std::vector<float>>(values, values + n));
+        return;
+    }
+    addFieldImpl(fd, values, n, nullptr);
+}
+
+void ZarrStore::addField(const FieldDescription& fd, std::vector<float>&& values) {
+    if (encodesAsync()) {
+        auto owned = std::make_shared<const std::vector<float>>(std::move(values));
+        addFieldImpl(fd, owned->data(), owned->size(), owned);
+        return;
+    }
+    addFieldImpl(fd, values.data(), values.size(), nullptr);
+}
+
+/// `owned`: the values as a buffer the compression job keeps alive (set iff encodesAsync())
+void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, std::size_t n,
+                             const std::shared_ptr<const std::vector<float>>& owned) {
     if (static_cast<std::int64_t>(n) != nx_ * ny_) {
         std::ostringstream oss;
         oss << "zarr action: field " << fd.prefix << "*" << fd.suffix << " level " << fd.level << " of store "
@@ -555,8 +597,21 @@ void ZarrStore::addField(const FieldDescription& fd, const float* values, std::s
     const Variable& v = vars_[vi];
     const std::size_t nbytes = n * sizeof(float);
 
+    // A chunk file (2-D, chunk-per-level): encoded and written here, or by a worker. The job only uses the path,
+    // the owned values, the compression settings and the (thread-safe) directory cache. (A field sent twice for
+    // the same step gives two jobs for one file; each write is atomic, but which one lands last is not defined.)
+    auto chunkFile = [&](std::string path, bool ensureDir) {
+        if (!owned) {
+            encodeChunk(path, ensureDir, values, nbytes);
+            return;
+        }
+        pool_->submit(st.jobs, [this, path = std::move(path), ensureDir, owned, nbytes] {
+            encodeChunk(path, ensureDir, owned->data(), nbytes);
+        });
+    };
+
     if (!v.is3d) {
-        writeChunk(chunkPath(v, st.timeIndex, 0), values, nbytes);
+        chunkFile(chunkPath(v, st.timeIndex, 0), true);
         return;
     }
 
@@ -577,12 +632,26 @@ void ZarrStore::addField(const FieldDescription& fd, const float* values, std::s
     }
 
     if (layout_ == Layout::ShardLevels) {
-        st.shards[vi][fd.level].assign(values, values + n);
+        // inner chunk kept until the flush, compressed on arrival (a replaced slot stays alive for its job)
+        auto slot = std::make_shared<std::vector<unsigned char>>();
+        st.shards[vi][fd.level] = slot;
+        if (!compression_.enabled()) {
+            const auto* b = reinterpret_cast<const unsigned char*>(values);
+            slot->assign(b, b + nbytes);
+        }
+        else if (!owned) {
+            *slot = compressExact(compression_, values, nbytes);
+        }
+        else {
+            pool_->submit(st.jobs, [this, slot, owned, nbytes] {
+                *slot = compressExact(compression_, owned->data(), nbytes);
+            });
+        }
         return;
     }
 
     if (a.frozen) {
-        writeChunk(chunkPath(v, st.timeIndex, k), values, nbytes);
+        chunkFile(chunkPath(v, st.timeIndex, k), true);
         return;
     }
 
@@ -590,8 +659,8 @@ void ZarrStore::addField(const FieldDescription& fd, const float* values, std::s
     // variable's own directory (no shared staging directory, no Lustre directory-lock contention)
     std::string staging
         = varPath(v) + "/.staging_s" + std::to_string(fd.step) + "_L" + std::to_string(fd.level);
-    writeFileAtomic(staging, values, nbytes);
-    st.staged[{vi, fd.level}] = std::move(staging);
+    st.staged[{vi, fd.level}] = staging;
+    chunkFile(std::move(staging), false);
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -625,6 +694,10 @@ void ZarrStore::flush(std::optional<std::int64_t> step, std::optional<double> le
 void ZarrStore::closeStep(OpenStep& st, std::optional<double> leadTime) {
     const std::size_t t = st.timeIndex;
     const std::int64_t step = st.step;
+
+    // 0. Wait for the compression jobs of this step (only); an error of a job is rethrown here and the step
+    // stays open
+    st.jobs->wait();
     finalized_ = false;
 
     // 1. Freeze the level axes that were discovered with this step
@@ -714,6 +787,10 @@ void ZarrStore::finalize() {
     if (!open_.empty()) {
         std::size_t nstaged = 0;
         for (auto& o : open_) {
+            if (o.second.jobs->waitNoThrow()) {
+                eckit::Log::warning() << "zarr action: " << name_ << ": a compression job of the discarded step "
+                                      << o.second.step << " failed" << std::endl;
+            }
             for (const auto& s : o.second.staged) {
                 removeFile(s.second);
             }
@@ -765,22 +842,22 @@ std::string ZarrStore::arrayJson(const Variable& v) const {
     attrs += "}";
 
     const std::int64_t nt = static_cast<std::int64_t>(times_.size());
-    const std::string bytesCodecs = std::string("[") + BYTES_CODEC + "]";
+    const std::string chunkCodecs = std::string("[") + BYTES_CODEC + compression_.codecsJsonTail() + "]";
 
     if (!v.is3d) {
-        return arrayDocument({nt, ny_, nx_}, "float32", {1, ny_, nx_}, bytesCodecs, attrs, {"time", "y", "x"});
+        return arrayDocument({nt, ny_, nx_}, "float32", {1, ny_, nx_}, chunkCodecs, attrs, {"time", "y", "x"});
     }
 
     const Axis& a = axes_[v.axis];
     const std::int64_t nlev = static_cast<std::int64_t>(a.levels.size());
     if (layout_ == Layout::ShardLevels) {
         std::string codecs = "[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":"
-                           + jsonIntArray({1, 1, ny_, nx_}) + ",\"codecs\":[" + BYTES_CODEC + "],\"index_codecs\":["
+                           + jsonIntArray({1, 1, ny_, nx_}) + ",\"codecs\":" + chunkCodecs + ",\"index_codecs\":["
                            + BYTES_CODEC + "],\"index_location\":\"end\"}}]";
         return arrayDocument({nt, nlev, ny_, nx_}, "float32", {1, nlev, ny_, nx_}, codecs, attrs,
                              {"time", a.dim, "y", "x"});
     }
-    return arrayDocument({nt, nlev, ny_, nx_}, "float32", {1, 1, ny_, nx_}, bytesCodecs, attrs,
+    return arrayDocument({nt, nlev, ny_, nx_}, "float32", {1, 1, ny_, nx_}, chunkCodecs, attrs,
                          {"time", a.dim, "y", "x"});
 }
 
@@ -835,23 +912,28 @@ std::string ZarrStore::rootJson() const {
 
 //----------------------------------------------------------------------------------------------------------------------
 
-void ZarrStore::writeShard(const Variable& v, std::size_t t, const std::map<std::int64_t, std::vector<float>>& levels) {
+void ZarrStore::writeShard(const Variable& v, std::size_t t,
+                           const std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>& levels) {
     const Axis& a = axes_[v.axis];
     const std::size_t nlev = a.levels.size();
     const std::size_t chunkBytes = static_cast<std::size_t>(nx_ * ny_) * sizeof(float);
 
-    std::size_t present = 0;
+    std::size_t total = 0;
     for (const auto& l : levels) {
         if (a.index.find(l.first) == a.index.end()) {
             std::ostringstream oss;
             oss << "zarr action: level " << l.first << " of " << v.name << " not on axis " << a.dim;
             throw eckit::SeriousBug(oss.str(), Here());
         }
-        ++present;
+        if (!compression_.enabled() && l.second->size() != chunkBytes) {
+            throw eckit::SeriousBug("zarr action: inner chunk of " + v.name + " has the wrong size", Here());
+        }
+        total += l.second->size();
     }
 
-    // [inner chunks][index: nlev x (offset uint64, nbytes uint64), little endian], index at the end
-    std::vector<unsigned char> buf(present * chunkBytes + nlev * 2 * sizeof(std::uint64_t));
+    // [inner chunks][index: nlev x (offset uint64, nbytes uint64), little endian], index at the end.
+    // With compression the inner chunks have their compressed sizes.
+    std::vector<unsigned char> buf(total + nlev * 2 * sizeof(std::uint64_t));
     std::vector<std::uint64_t> index(2 * nlev, std::numeric_limits<std::uint64_t>::max());
     std::size_t off = 0;
     for (std::size_t k = 0; k < nlev; ++k) {
@@ -859,10 +941,13 @@ void ZarrStore::writeShard(const Variable& v, std::size_t t, const std::map<std:
         if (it == levels.end()) {
             continue;
         }
-        std::memcpy(buf.data() + off, it->second.data(), chunkBytes);
+        const std::vector<unsigned char>& c = *it->second;
+        if (!c.empty()) {
+            std::memcpy(buf.data() + off, c.data(), c.size());
+        }
         index[2 * k] = off;
-        index[2 * k + 1] = chunkBytes;
-        off += chunkBytes;
+        index[2 * k + 1] = c.size();
+        off += c.size();
     }
     std::memcpy(buf.data() + off, index.data(), index.size() * sizeof(std::uint64_t));
 

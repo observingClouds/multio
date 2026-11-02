@@ -345,6 +345,88 @@ def check_static_stores(root):
         print(f"static-reference: {sorted(g.array_keys())}, latitude {g['latitude'].shape}")
 
 
+# --- zstd compression (TestZarr.cc runZstd: the synthetic run with compression zstd level 5)
+ZSTD_STORES = {"zstd-chunk-per-level-t0": "chunk-per-level", "zstd-chunk-per-level-t4": "chunk-per-level",
+               "zstd-chunk-per-level-t1q1": "chunk-per-level", "zstd-shard-levels-t0": "shard-levels",
+               "zstd-shard-levels-t4": "shard-levels"}
+
+
+def codec_names(codecs):
+    return [type(c).__name__ for c in codecs]
+
+
+def check_zstd_codecs(g, label, sharded):
+    for name, _, axis, *_ in VARS:
+        codecs = g[name].metadata.codecs
+        if sharded and axis is not None:
+            check(codec_names(codecs) == ["ShardingCodec"], f"{label}: {name} codecs {codec_names(codecs)}")
+            inner, index = codecs[0].codecs, codecs[0].index_codecs
+            check(codec_names(index) == ["BytesCodec"], f"{label}: {name} index codecs {codec_names(index)}")
+        else:
+            inner = codecs
+        check(codec_names(inner) == ["BytesCodec", "ZstdCodec"], f"{label}: {name} codecs {codec_names(inner)}")
+        z = [c for c in inner if type(c).__name__ == "ZstdCodec"]
+        check(bool(z) and z[0].level == 5 and z[0].checksum is False, f"{label}: {name} zstd {z}")
+    for name in ["time", "level_S", "x", "latitude"]:
+        check("ZstdCodec" not in codec_names(g[name].metadata.codecs), f"{label}: {name} compressed")
+
+
+def check_zstd_rewrite(path, label):
+    """Rewrite the 3-D arrays with zarr-python (same codecs) into a copy; its shards decode to the same values."""
+    tmp = tempfile.mkdtemp(prefix="zarr-zstd-check-")
+    try:
+        cp = os.path.join(tmp, "copy.zarr")
+        shutil.copytree(path, cp)
+        same_bytes = 0
+        total = 0
+        for name, _, axis, *_ in VARS:
+            if axis is None:
+                continue
+            shutil.rmtree(os.path.join(cp, name, "c"))
+            a = zarr.open_array(os.path.join(cp, name), mode="r+")
+            a[...] = expected(name)
+            b = zarr.open_array(os.path.join(path, name), mode="r")
+            check(bit_equal(a[...], b[...]), f"{label}: {name} zarr-python rewrite differs")
+            for t in range(len(STEPS)):
+                rel = os.path.join(name, "c", str(t), "0", "0", "0")
+                if os.path.exists(os.path.join(cp, rel)) and os.path.exists(os.path.join(path, rel)):
+                    total += 1
+                    with open(os.path.join(cp, rel), "rb") as f1, open(os.path.join(path, rel), "rb") as f2:
+                        same_bytes += f1.read() == f2.read()
+        print(f"{label}: {same_bytes} of {total} shards byte-identical to zarr-python's (informational)")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def check_zstd_stores(root, plain):
+    for sub, layout in ZSTD_STORES.items():
+        path = os.path.join(root, sub, "TESTDOM.zarr")
+        for consolidated in (True, False):
+            g = check_zarr(path, sub, consolidated)
+            check_xarray(path, sub, consolidated)
+        check_zstd_codecs(g, sub, layout == "shard-levels")
+        gp = zarr.open_group(plain[layout], mode="r")
+        for name, *_ in VARS:
+            check(bit_equal(g[name][...], gp[name][...]), f"{sub}: {name} differs from the uncompressed store")
+        print(f"{sub}: {count_files(path)} files, {du(path)} bytes (uncompressed {du(plain[layout])})")
+    check_zstd_rewrite(os.path.join(root, "zstd-shard-levels-t4", "TESTDOM.zarr"), "zstd-shard-levels-t4")
+    # ZarrStore under load (worker pool vs inline): readable, same values
+    for ln in ["chunk", "shard"]:
+        g0 = zarr.open_group(os.path.join(root, f"zstd-load-{ln}-t0", "LOAD.zarr"), mode="r")
+        g3 = zarr.open_group(os.path.join(root, f"zstd-load-{ln}-t3", "LOAD.zarr"), mode="r")
+        names = sorted(g0.array_keys())
+        check(names == sorted(g3.array_keys()) and len(names) == 8, f"zstd-load-{ln}: arrays {names}")
+        for n in names:
+            check(np.array_equal(g0[n][...], g3[n][...], equal_nan=True), f"zstd-load-{ln}: {n} differs")
+        v = g3["S_VAR0"][...]
+        check(v.shape == (3, 12, 173, 211) and np.isnan(v[:, :, 0, 3]).all() and np.isfinite(v).sum() == v.size - 36,
+              f"zstd-load-{ln}: S_VAR0 {v.shape}, NaN count {np.isnan(v).sum()}")
+
+
+def du(path):
+    return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(path) for f in fs)
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "zarr-selftest"
     print(f"zarr {zarr.__version__} ({zarr.__file__}), xarray {xr.__version__}, numpy {np.__version__}")
@@ -380,6 +462,7 @@ def main():
         check(bit_equal(g1[name][...], g2[name][...]), f"fullpos shard vs chunk: {name}")
     check_payload_errors(root)
     check_static_stores(root)
+    check_zstd_stores(root, {"chunk-per-level": stores["chunk-per-level"], "shard-levels": stores["shard-levels"]})
 
     if failures:
         print(f"{len(failures)} FAILURES")

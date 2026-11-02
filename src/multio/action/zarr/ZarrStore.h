@@ -15,17 +15,21 @@
 ///   3-D  <L>_<SUFFIX>  (time, level_<L>, y, x)
 ///   2-D  <PREF><SUFFIX> (time, y, x)
 ///   float32, fill value NaN, bytes codec little endian, consolidated metadata in the root zarr.json.
+/// With compression the time-dependent arrays get a zstd codec after the bytes codec (shard-levels: inside the
+/// sharding codec, the shard index stays uncompressed); static arrays and coordinates stay uncompressed.
 
 #pragma once
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "ZarrCodec.h"
 #include "ZarrUtil.h"
 
 namespace multio::action::zarr {
@@ -67,18 +71,28 @@ struct StoreSetup {
     std::optional<std::int64_t> nx;
     std::optional<std::int64_t> ny;
     std::optional<std::string> forecastReferenceTime;
+    Compression compression;     // chunk compression of the time-dependent arrays
+    WorkerPool* pool = nullptr;  // compression workers (owned by the action); nullptr: compress inline
 };
 
 class ZarrStore {
 public:
     explicit ZarrStore(const StoreSetup& setup);
-    ~ZarrStore() = default;
+    ~ZarrStore();  // waits for the outstanding compression jobs (their data is discarded unless flushed)
 
     ZarrStore(const ZarrStore&) = delete;
     ZarrStore& operator=(const ZarrStore&) = delete;
 
-    /// Add one global field of nx*ny float32 values (C order, x fastest)
+    /// Add one global field of nx*ny float32 values (C order, x fastest). With compression and a worker pool
+    /// the values are copied and compressed (and, chunk-per-level and 2-D, written) by a worker; the call only
+    /// waits if the pool's queue is full.
     void addField(const FieldDescription& fd, const float* values, std::size_t n);
+
+    /// As above, taking over the values (no copy for the worker)
+    void addField(const FieldDescription& fd, std::vector<float>&& values);
+
+    /// True if addField hands the values to worker threads (then the vector overload avoids a copy)
+    bool encodesAsync() const { return compression_.enabled() && pool_ != nullptr; }
 
     /// Close an output step. Without a step, all open steps are closed (in order of appearance).
     /// A step that has already been closed is not closed again; a step without any field creates no
@@ -130,8 +144,12 @@ private:
         std::optional<double> leadTime;
         // chunk-per-level, axis not yet frozen: (variable, level) -> staging file
         std::map<std::pair<std::size_t, std::int64_t>, std::string> staged;
-        // shard-levels: variable -> level -> values
-        std::unordered_map<std::size_t, std::map<std::int64_t, std::vector<float>>> shards;
+        // shard-levels: variable -> level -> encoded inner chunk (raw or compressed bytes; filled by a worker
+        // until `jobs` is done)
+        std::unordered_map<std::size_t, std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>>
+            shards;
+        // compression jobs of this step (closing the step waits for them)
+        std::shared_ptr<JobGroup> jobs;
     };
 
     enum class NodeKind
@@ -162,8 +180,12 @@ private:
     std::string varPath(const Variable& v) const { return root_ + "/" + v.name; }
     std::string chunkPath(const Variable& v, std::size_t t, std::int64_t k) const;
 
+    void addFieldImpl(const FieldDescription& fd, const float* values, std::size_t n,
+                      const std::shared_ptr<const std::vector<float>>& owned);
     void writeChunk(const std::string& path, const void* data, std::size_t nbytes);
-    void writeShard(const Variable& v, std::size_t t, const std::map<std::int64_t, std::vector<float>>& levels);
+    void encodeChunk(const std::string& path, bool ensureDir, const float* values, std::size_t nbytes) const;
+    void writeShard(const Variable& v, std::size_t t,
+                    const std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>& levels);
     void writeArrayMeta(const Variable& v);
     void writeTime(std::size_t t);
     void writeLevel(const Axis& a);
@@ -198,7 +220,9 @@ private:
     std::int64_t lastStep_ = 0;
 
     bool finalized_ = false;
-    DirectoryCache dirs_;
+    Compression compression_;
+    WorkerPool* pool_ = nullptr;
+    mutable DirectoryCache dirs_;  // shared with the compression workers (thread-safe)
 };
 
 }  // namespace multio::action::zarr

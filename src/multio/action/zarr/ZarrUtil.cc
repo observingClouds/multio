@@ -693,10 +693,14 @@ void removeFile(const std::string& path) noexcept {
 }
 
 void DirectoryCache::ensure(const std::string& dir) {
-    if (known_.find(dir) != known_.end()) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (known_.find(dir) != known_.end()) {
+            return;
+        }
     }
-    makeDirs(dir);
+    makeDirs(dir);  // outside the lock: no serialisation of the mkdir calls of different directories
+    std::lock_guard<std::mutex> lock(mutex_);
     known_.insert(dir);
 }
 

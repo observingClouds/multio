@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -36,6 +37,8 @@
 
 #include "eckit/testing/Test.h"
 
+#include "multio/action/zarr/ZarrCodec.h"
+#include "multio/action/zarr/ZarrStore.h"
 #include "multio/action/zarr/ZarrUtil.h"
 #include "multio/domain/Mappings.h"
 #include "multio/message/Message.h"
@@ -296,7 +299,9 @@ Message flushMessage(const std::string& domain, std::int64_t step, const std::st
     return Message{Message::Header{Message::Tag::Flush, CLIENTS[c], SERVER, std::move(md)}};
 }
 
-std::string planJson(const std::string& path, const std::string& layout, const std::string& coords) {
+/// `extra`: further members of the zarr action, e.g. R"(, "compression": {"codec": "zstd"})"
+std::string planJson(const std::string& path, const std::string& layout, const std::string& coords,
+                     const std::string& extra = "") {
     std::ostringstream oss;
     oss << R"({"name": "ial-to-zarr", "actions": [)"
         << R"({"type": "select", "match": [{"category": ["ial-field", "ial-static"]}]},)"
@@ -305,7 +310,7 @@ std::string planJson(const std::string& path, const std::string& layout, const s
     if (!coords.empty()) {
         oss << R"(, "coordinates-from": ")" << coords << R"(")";
     }
-    oss << "}]}";
+    oss << extra << "}]}";
     return oss.str();
 }
 
@@ -1390,11 +1395,336 @@ CASE("static arrays of the reference store, byte-identical (MULTIO_ZARR_REFERENC
     }
 }
 
+//----------------------------------------------------------------------------------------------------------------------
+// zstd compression
+
+/// Relative paths of the regular files below dir, sorted
+std::vector<std::string> fileList(const Path& dir) {
+    std::vector<std::string> out;
+    const std::size_t n = dir.string().size() + 1;
+    walk(dir, [&](const Path& p, bool regular) {
+        if (regular) {
+            out.push_back(p.string().substr(n));
+        }
+    });
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+/// The two trees have the same files with the same bytes
+bool sameTree(const Path& a, const Path& b) {
+    const auto fa = fileList(a);
+    if (fa != fileList(b)) {
+        return false;
+    }
+    for (const auto& f : fa) {
+        if (readText(a / f) != readText(b / f)) {
+            std::cout << "differs: " << f << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<float> decodeZstd(const std::string& b) {
+    auto raw = multio::action::zarr::decompressZstd(b.data(), b.size());
+    std::vector<float> v(raw.size() / sizeof(float));
+    std::memcpy(v.data(), raw.data(), v.size() * sizeof(float));
+    return v;
+}
+
+const std::string ZSTD_CODECS
+    = R"("codecs":[{"name":"bytes","configuration":{"endian":"little"}},{"name":"zstd","configuration":{"level":5,"checksum":false}}])";
+
+/// The synthetic run of runLayout with zstd level 5 and `threads` workers into <selftest>/<sub>
+Path runZstd(const std::string& layout, int threads, const std::string& sub, int queue = -1) {
+    const std::string domain = "TESTDOM";
+    const Path root = absolute(outRoot());
+    const Path out = root / sub;
+    const Path coords = root / "coords";
+    removeAll(out);
+    writeCoordinateStore(coords, domain);
+    registerDomain(domain);
+    std::string extra = R"(, "compression": {"codec": "zstd", "level": 5}, "compression-threads": )"
+                      + std::to_string(threads);
+    if (queue >= 0) {
+        extra += R"(, "compression-queue": )" + std::to_string(queue);
+    }
+    {
+        auto env = MultioTestEnvironment(planJson(out.string(), layout, coords.string(), extra));
+        runSteps(env, domain, "end-of-simulation");
+    }
+    return out / (domain + ".zarr");
+}
+
+CASE("zstd compression, chunk-per-level: inline and worker threads give the same store") {
+    if (!multio::action::zarr::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    const Path s0 = runZstd("chunk-per-level", 0, "zstd-chunk-per-level-t0");
+    const Path s4 = runZstd("chunk-per-level", 4, "zstd-chunk-per-level-t4");
+    const Path s1 = runZstd("chunk-per-level", 1, "zstd-chunk-per-level-t1q1", 1);
+    EXPECT(sameTree(s0, s4));
+    EXPECT(sameTree(s0, s1));
+    EXPECT_EQUAL(countStaging(s4), 0u);
+    EXPECT_EQUAL(readText(s4 / ".last_step"), std::string("step=96 time_index=2 inc=0002:00:00\n"));
+
+    // codecs of the time-dependent arrays (also in the consolidated metadata); static arrays uncompressed
+    for (const std::string name : {"S_TEMPERATURE", "SURFTEMPERATURE", "KT_ISOT_ALTIT"}) {
+        EXPECT(readText(s4 / name / "zarr.json").find(ZSTD_CODECS) != std::string::npos);
+    }
+    EXPECT(readText(s4 / "time" / "zarr.json").find("zstd") == std::string::npos);
+    EXPECT(readText(s4 / "level_S" / "zarr.json").find("zstd") == std::string::npos);
+    EXPECT(readText(s4 / "x" / "zarr.json").find("zstd") == std::string::npos);
+    const std::string rootDoc = readText(s4 / "zarr.json");
+    std::size_t nzstd = 0;
+    for (std::size_t p = rootDoc.find("\"zstd\""); p != std::string::npos; p = rootDoc.find("\"zstd\"", p + 1)) {
+        ++nzstd;
+    }
+    EXPECT_EQUAL(nzstd, VARS.size());
+
+    // the chunks are zstd frames of the raw values (NaN of SURFTEMPERATURE included)
+    checkLevelChunk(decodeZstd(readText(s4 / "S_TEMPERATURE" / "c" / "0" / "0" / "0" / "0")), 1, 0, 1);
+    checkLevelChunk(decodeZstd(readText(s4 / "S_TEMPERATURE" / "c" / "2" / "2" / "0" / "0")), 1, 96, 3);
+    checkLevelChunk(decodeZstd(readText(s4 / "CLSTEMPERATURE" / "c" / "1" / "0" / "0")), 5, 48, 0);
+    const auto surf = decodeZstd(readText(s4 / "SURFTEMPERATURE" / "c" / "2" / "0" / "0"));
+    checkLevelChunk(surf, 4, 96, 0);
+    EXPECT(std::isnan(surf[7]));
+    EXPECT(!exists(s4 / "KT_ISOT_ALTIT" / "c" / "0" / "1" / "0" / "0"));
+}
+
+CASE("zstd compression, shard-levels: compressed inner chunks, index of compressed sizes") {
+    if (!multio::action::zarr::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    const Path s0 = runZstd("shard-levels", 0, "zstd-shard-levels-t0");
+    const Path s4 = runZstd("shard-levels", 4, "zstd-shard-levels-t4");
+    EXPECT(sameTree(s0, s4));
+    EXPECT_EQUAL(countStaging(s4), 0u);
+
+    const std::string tdoc = readText(s4 / "S_TEMPERATURE" / "zarr.json");
+    EXPECT(tdoc.find(R"("name":"sharding_indexed")") != std::string::npos);
+    EXPECT(tdoc.find(R"("configuration":{"chunk_shape":[1,1,4,5],)" + ZSTD_CODECS
+                     + R"(,"index_codecs":[{"name":"bytes","configuration":{"endian":"little"}}],"index_location":"end"})")
+           != std::string::npos);
+    EXPECT(readText(s4 / "SURFTEMPERATURE" / "zarr.json").find(ZSTD_CODECS) != std::string::npos);
+
+    // shard [frames][index nlev x (offset, nbytes)]: frames back to back, each one decodes to its level
+    auto checkShard = [&](const Path& shard, int id, std::int64_t step, const std::vector<std::int64_t>& axis,
+                          const std::vector<std::int64_t>& present) {
+        const std::string b = readText(shard);
+        const std::size_t nlev = axis.size();
+        EXPECT(b.size() > nlev * 16);
+        std::vector<std::uint64_t> idx(2 * nlev);
+        std::memcpy(idx.data(), b.data() + b.size() - nlev * 16, nlev * 16);
+        std::uint64_t off = 0;
+        for (std::size_t k = 0; k < nlev; ++k) {
+            const bool has = std::find(present.begin(), present.end(), axis[k]) != present.end();
+            if (!has) {
+                EXPECT(idx[2 * k] == std::numeric_limits<std::uint64_t>::max());
+                EXPECT(idx[2 * k + 1] == std::numeric_limits<std::uint64_t>::max());
+                continue;
+            }
+            EXPECT_EQUAL(idx[2 * k], off);
+            EXPECT(idx[2 * k + 1] > 0 && idx[2 * k + 1] != static_cast<std::uint64_t>(NPTS * 4));
+            checkLevelChunk(decodeZstd(b.substr(idx[2 * k], idx[2 * k + 1])), id, step, axis[k]);
+            off += idx[2 * k + 1];
+        }
+        EXPECT_EQUAL(off + nlev * 16, static_cast<std::uint64_t>(b.size()));
+    };
+    checkShard(s4 / "S_TEMPERATURE" / "c" / "1" / "0" / "0" / "0", 1, 48, {1, 2, 3}, {1, 2, 3});
+    checkShard(s4 / "KT_ISOT_ALTIT" / "c" / "0" / "0" / "0" / "0", 3, 0, {1, 2}, {1});
+    checkShard(s4 / "S_HUMI.SPECIFI" / "c" / "2" / "0" / "0" / "0", 6, 96, {1, 2, 3}, {1, 3});
+    const auto surf = decodeZstd(readText(s4 / "SURFTEMPERATURE" / "c" / "0" / "0" / "0"));
+    checkLevelChunk(surf, 4, 0, 0);
+    EXPECT(std::isnan(surf[7]));
+}
+
+/// Many larger fields through ZarrStore directly: the worker pool (small queue, several threads) writes the same
+/// bytes as inline compression, in both layouts
+CASE("zstd compression: worker pool under load, ZarrStore directly") {
+    namespace z = multio::action::zarr;
+    if (!z::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    const std::int64_t nx = 211;
+    const std::int64_t ny = 173;
+    auto field = [&](int var, std::int64_t step, std::int64_t lev) {
+        std::vector<float> v(static_cast<std::size_t>(nx * ny));
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const double x = static_cast<double>(i % nx) / nx;
+            const double y = static_cast<double>(i / nx) / ny;
+            v[i] = static_cast<float>(250.0 + var + 10.0 * std::sin(6.0 * x + lev) * std::cos(4.0 * y + step)
+                                      + 1e-3 * static_cast<double>((i * 2654435761u) % 1000));
+        }
+        if (var == 0) {
+            v[3] = std::numeric_limits<float>::quiet_NaN();
+        }
+        return v;
+    };
+    for (const auto layout : {z::Layout::ChunkPerLevel, z::Layout::ShardLevels}) {
+        const std::string ln = layout == z::Layout::ShardLevels ? "shard" : "chunk";
+        std::vector<Path> stores;
+        for (int threads : {0, 3}) {
+            const Path dir = absolute(outRoot()) / ("zstd-load-" + ln + "-t" + std::to_string(threads));
+            removeAll(dir);
+            std::unique_ptr<z::WorkerPool> pool;
+            if (threads > 0) {
+                pool = std::make_unique<z::WorkerPool>(threads, 2);
+            }
+            z::StoreSetup setup;
+            setup.name = "LOAD";
+            setup.dir = dir.string();
+            setup.layout = layout;
+            setup.nx = nx;
+            setup.ny = ny;
+            setup.forecastReferenceTime = FRT;
+            setup.compression = z::Compression{z::Codec::Zstd, 1};
+            setup.pool = pool.get();
+            {
+                z::ZarrStore st(setup);
+                EXPECT(st.encodesAsync() == (threads > 0));
+                for (std::int64_t step = 0; step < 3; ++step) {
+                    for (int var = 0; var < 6; ++var) {
+                        z::FieldDescription fd;
+                        fd.prefix = var < 4 ? "S" : "SURF";
+                        fd.suffix = "VAR" + std::to_string(var);
+                        fd.is3d = var < 4;
+                        fd.step = step;
+                        fd.leadTime = 3600.0 * step;
+                        for (std::int64_t lev = 1; lev <= (fd.is3d ? 12 : 1); ++lev) {
+                            fd.level = fd.is3d ? lev : 0;
+                            if (var % 2) {
+                                st.addField(fd, field(var, step, lev));  // moved
+                            }
+                            else {
+                                auto v = field(var, step, lev);
+                                st.addField(fd, v.data(), v.size());  // copied
+                            }
+                        }
+                    }
+                    st.flush(step, std::nullopt);
+                }
+                st.finalize();
+            }
+            stores.push_back(dir / "LOAD.zarr");
+        }
+        EXPECT(sameTree(stores[0], stores[1]));
+        EXPECT_EQUAL(countStaging(stores[1]), 0u);
+    }
+}
+
+/// A failing compression job (here: its chunk directory cannot be created) is reported by the flush of its
+/// step, not lost; the other steps are not affected
+CASE("zstd compression: an error in a worker is rethrown by the flush") {
+    if (!multio::action::zarr::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    if (::geteuid() == 0) {
+        std::cout << "running as root, skipped" << std::endl;
+        return;
+    }
+    const std::string domain = "TESTDOM";
+    for (int threads : {2, 0}) {
+        const Path out = absolute(outRoot()) / ("zstd-worker-error-t" + std::to_string(threads));
+        removeAll(out);
+        registerDomain(domain);
+        const Path cdir = out / (domain + ".zarr") / "SURFTEMPERATURE" / "c";
+        const Var& surf = VARS[3];
+        bool threwAtField = false;
+        bool threwAtFlush = false;
+        {
+            auto env = MultioTestEnvironment(planJson(
+                out.string(), "chunk-per-level", "",
+                R"(, "compression": {"codec": "zstd"}, "compression-threads": )" + std::to_string(threads)));
+            for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                env.process(fieldMessage(domain, surf, 0, 0, c));
+            }
+            for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                env.process(flushMessage(domain, 0, "step", c));
+            }
+            ::chmod(cdir.string().c_str(), 0555);  // c/1 cannot be created
+            try {
+                for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                    env.process(fieldMessage(domain, surf, 48, 0, c));
+                }
+            }
+            catch (const std::exception&) {
+                threwAtField = true;
+            }
+            try {
+                for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                    env.process(flushMessage(domain, 48, "step", c));
+                }
+            }
+            catch (const std::exception& e) {
+                std::cout << "flush: " << e.what() << std::endl;
+                threwAtFlush = true;
+            }
+            ::chmod(cdir.string().c_str(), 0755);
+        }  // destructor: the failed step is still open and discarded
+        const Path s = out / (domain + ".zarr");
+        EXPECT_EQUAL(countStaging(s), 0u);
+        if (threads == 0) {
+            EXPECT(threwAtField);  // inline: the field itself fails, as without compression
+            continue;
+        }
+        EXPECT(!threwAtField);
+        EXPECT(threwAtFlush);
+        // the failed step stayed open and was discarded by the destructor
+        EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=0 time_index=0 inc=0000:00:00\n"));
+        EXPECT(readText(s / "SURFTEMPERATURE" / "zarr.json").find("\"shape\":[1,4,5]") != std::string::npos);
+    }
+}
+
 CASE("configuration errors") {
     EXPECT_THROWS(MultioTestEnvironment(R"({"name": "z", "actions": [{"type": "zarr"}]})"));
     EXPECT_THROWS(MultioTestEnvironment(R"({"name": "z", "actions": [{"type": "zarr", "path": "x", "format": 2}]})"));
     EXPECT_THROWS(
         MultioTestEnvironment(R"({"name": "z", "actions": [{"type": "zarr", "path": "x", "layout": "foo"}]})"));
+
+    // compression
+    auto zarrWith = [](const std::string& members) {
+        return std::string(R"({"name": "z", "actions": [{"type": "zarr", "path": ")") + absolute(outRoot()).string()
+             + R"(/config-errors")" + members + "}]}";
+    };
+    auto expectUserError = [&](const std::string& members, const std::string& what) {
+        try {
+            MultioTestEnvironment env(zarrWith(members));
+            std::cout << "no error for " << members << std::endl;
+            EXPECT(false);
+        }
+        catch (const eckit::UserError& e) {
+            const std::string msg = e.what();
+            if (msg.find(what) == std::string::npos) {
+                std::cout << "unexpected message for " << members << ": " << msg << std::endl;
+            }
+            EXPECT(msg.find(what) != std::string::npos);
+        }
+    };
+    expectUserError(R"(, "compression": {"codec": "lz4"})", "unknown compression codec 'lz4'");
+    expectUserError(R"(, "compression": "gzip")", "unknown compression codec 'gzip'");
+    expectUserError(R"(, "compression": {"level": 3})", "needs 'codec'");
+    expectUserError(R"(, "compression": {"codec": "zstd", "lvl": 3})", "unknown key 'compression.lvl'");
+    expectUserError(R"(, "compression": [1, 2])", "must be a codec name");
+    expectUserError(R"(, "compression-threads": -1)", "'compression-threads' is -1");
+    expectUserError(R"(, "compression-threads": "four")", "'compression-threads' must be an integer");
+    expectUserError(R"(, "compression-queue": 100000)", "'compression-queue' is 100000");
+    if (multio::action::zarr::zstdAvailable()) {
+        expectUserError(R"(, "compression": {"codec": "zstd", "level": 23})", "zstd compression level 23 out of range");
+        expectUserError(R"(, "compression": {"codec": "zstd", "level": "high"})", "must be an integer");
+        // valid
+        MultioTestEnvironment(zarrWith(R"(, "compression": {"codec": "zstd", "level": 19}, "compression-threads": 0)"));
+        MultioTestEnvironment(zarrWith(R"(, "compression": "zstd")"));
+        MultioTestEnvironment(zarrWith(R"(, "compression": {"codec": "none"}, "compression-threads": 8)"));
+    }
+    else {
+        expectUserError(R"(, "compression": {"codec": "zstd"})", "built without libzstd");
+    }
 }
 
 }  // namespace multio::test::zarr

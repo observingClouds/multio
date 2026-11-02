@@ -19,6 +19,14 @@
 ///     layout: chunk-per-level         # (default) or shard-levels
 ///     coordinates-from: <dir>         # optional: copy static arrays and root attributes from <dir>/<domain>.zarr
 ///     timestep: <seconds>             # optional fallback if fields carry no `timestep`
+///     compression: {codec: zstd, level: 3}   # optional, default none (or the string none / zstd)
+///     compression-threads: 4          # compression workers (default 4); 0: compress on the receiving thread
+///     compression-queue: 8            # fields waiting for a worker before addField blocks (default 2 x threads)
+///
+/// Compression (zstd, lossless) applies to the time-dependent arrays: codecs [bytes, zstd] per chunk, and for
+/// shard-levels inside the sharding codec (each inner chunk compressed, the shard index uncompressed). The
+/// workers compress and, for chunk files, write; the receiving thread only copies the field and queues it. A
+/// step flush waits for the jobs of that step, then writes as without compression (see ZarrCodec.h).
 ///
 /// It is a terminal action (a sink): it needs the metadata of the message, which plain DataSinks do not get.
 ///
@@ -69,7 +77,11 @@ private:
     Layout layout_;
     std::optional<std::string> coordinatesFrom_;
     std::optional<double> timestep_;
+    Compression compression_;
+    std::size_t compressionThreads_ = 4;
+    std::size_t compressionQueue_ = 0;
 
+    std::unique_ptr<WorkerPool> pool_;  // with compression and compression-threads > 0; outlives the stores
     std::map<std::string, std::unique_ptr<ZarrStore>> stores_;
     std::vector<float> buffer_;
 };
