@@ -670,12 +670,14 @@ void Zarr::flush(const Message& msg) {
 
     // A flush for a step without fields in this store adds no time step (ZarrStore::flush); end-of-simulation
     // then only finalises. close-connection (sent by every client on multio_close_connections, after
-    // end-of-simulation) finalises only what is not finalised yet.
+    // end-of-simulation) finalises only what is not finalised yet. It is not aggregated (domain "global"):
+    // the first client to close may do so while steps of the others are still open, so a store with open
+    // steps is left alone; the aggregated end-of-simulation flush or the destructor finalises it.
     auto apply = [&](ZarrStore& s) {
         if (!closeOnly) {
             s.flush(step, lead);
         }
-        if (endOfSimulation || (closeOnly && !s.finalized())) {
+        if (endOfSimulation || (closeOnly && !s.finalized() && !s.hasOpenSteps())) {
             s.finalize();
         }
     };

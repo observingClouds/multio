@@ -521,6 +521,82 @@ CASE("finalisation in the destructor without end-of-simulation") {
     runLayout("chunk-per-level", "step", "no-eos");
 }
 
+// The clients' close-connection flushes (domain "global") pass the aggregate action one by one, so a
+// client that is done closes while the last step of the others is still being aggregated. That must
+// not finalise the store and drop the open step (with 624 clients the 3-D fields of the last but one
+// output step were lost).
+CASE("close-connection of one client while the last step is still open") {
+    for (const std::string layout : {"shard-levels", "chunk-per-level"}) {
+        const std::string domain = "TESTDOM";
+        const Path out = absolute(outRoot()) / ("early-close-" + layout);
+        removeAll(out);
+        registerDomain(domain);
+
+        auto closeMessage = [](std::size_t c) {
+            Metadata md;
+            md.set("domain", std::string("global"));
+            md.set("flushKind", std::string("close-connection"));
+            md.set("toAllServers", true);
+            return Message{Message::Header{Message::Tag::Flush, CLIENTS[c], SERVER, std::move(md)}};
+        };
+
+        {
+            auto env = MultioTestEnvironment(planJson(out.string(), layout, ""));
+            // the parts of client c for the first or the second half of VARS
+            auto send = [&](std::size_t c, std::size_t t, bool firstHalf) {
+                for (std::size_t i = 0; i < VARS.size(); ++i) {
+                    const auto& v = VARS[i];
+                    if ((i < VARS.size() / 2) != firstHalf || t < v.firstTime) {
+                        continue;
+                    }
+                    std::vector<std::int64_t> levels = v.levels.empty() ? std::vector<std::int64_t>{0} : v.levels;
+                    for (auto lev : levels) {
+                        env.process(fieldMessage(domain, v, STEPS[t], lev, c));
+                    }
+                }
+            };
+            for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                send(c, 0, true);
+                send(c, 0, false);
+            }
+            for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+                env.process(flushMessage(domain, STEPS[0], "step", c));
+            }
+            // last step: the first half of the variables is aggregated (open in the store), then
+            // client 0 sends the rest and its end-of-simulation flush and closes before client 1 is done
+            send(0, 1, true);
+            send(1, 1, true);
+            send(0, 1, false);
+            env.process(flushMessage(domain, STEPS[1], "end-of-simulation", 0));
+            env.process(closeMessage(0));
+            send(1, 1, false);
+            env.process(flushMessage(domain, STEPS[1], "end-of-simulation", 1));
+            env.process(closeMessage(1));
+        }
+
+        const Path s = out / (domain + ".zarr");
+        EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=48 time_index=1 inc=0001:00:00\n"));
+        EXPECT_EQUAL(countStaging(s), 0u);
+        EXPECT(readText(s / "S_TEMPERATURE" / "zarr.json").find("\"shape\":[2,3,4,5]") != std::string::npos);
+        // S_TEMPERATURE was aggregated before the early close, S_WIND.U.PHYS (level 2, k = 1) after it
+        if (layout == "shard-levels") {
+            const Path shard = s / "S_TEMPERATURE" / "c" / "1" / "0" / "0" / "0";
+            EXPECT(exists(shard));
+            EXPECT_EQUAL(fileSize(shard), static_cast<std::uintmax_t>(3 * NPTS * 4 + 3 * 16));
+            std::string b = readText(shard);
+            std::vector<float> first(NPTS);
+            std::memcpy(first.data(), b.data(), NPTS * 4);
+            checkLevelChunk(first, 1, 48, 1);
+            EXPECT(exists(s / "S_WIND.U.PHYS" / "c" / "1" / "0" / "0" / "0"));
+        }
+        else {
+            checkLevelChunk(readFloats(s / "S_TEMPERATURE" / "c" / "1" / "2" / "0" / "0"), 1, 48, 3);
+            checkLevelChunk(readFloats(s / "S_WIND.U.PHYS" / "c" / "1" / "1" / "0" / "0"), 7, 48, 2);
+        }
+        checkLevelChunk(readFloats(s / "CLSTEMPERATURE" / "c" / "1" / "0" / "0"), 5, 48, 0);
+    }
+}
+
 CASE("new level on a frozen axis is an error") {
     const Path out = absolute(outRoot()) / "frozen-axis";
     removeAll(out);
