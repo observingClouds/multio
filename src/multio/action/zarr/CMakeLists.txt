@@ -41,6 +41,8 @@ ecbuild_add_library(
         Zarr.h
         ZarrCodec.cc
         ZarrCodec.h
+        ZarrQuantize.cc
+        ZarrQuantize.h
         ZarrStore.cc
         ZarrStore.h
         ZarrUtil.cc

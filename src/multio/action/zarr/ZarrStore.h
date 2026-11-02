@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "ZarrCodec.h"
+#include "ZarrQuantize.h"
 #include "ZarrUtil.h"
 
 namespace multio::action::zarr {
@@ -72,6 +73,7 @@ struct StoreSetup {
     std::optional<std::int64_t> ny;
     std::optional<std::string> forecastReferenceTime;
     Compression compression;     // chunk compression of the time-dependent arrays
+    QuantRules quantize;         // lossy quantization before the compression, per array (needs compression)
     WorkerPool* pool = nullptr;  // compression workers (owned by the action); nullptr: compress inline
 };
 
@@ -84,8 +86,8 @@ public:
     ZarrStore& operator=(const ZarrStore&) = delete;
 
     /// Add one global field of nx*ny float32 values (C order, x fastest). With compression and a worker pool
-    /// the values are copied and compressed (and, chunk-per-level and 2-D, written) by a worker; the call only
-    /// waits if the pool's queue is full.
+    /// the values are copied, quantized (if a quantize rule applies to the array) and compressed (and,
+    /// chunk-per-level and 2-D, written) by a worker; the call only waits if the pool's queue is full.
     void addField(const FieldDescription& fd, const float* values, std::size_t n);
 
     /// As above, taking over the values (no copy for the worker)
@@ -135,6 +137,7 @@ private:
         bool is3d = false;
         int axis = -1;
         std::int64_t gribCode = 0;
+        Quantization quant;      // from the store's quantize rules (by name), applied by the compression jobs
         bool published = false;  // array metadata written, part of the consolidated metadata
     };
 
@@ -181,12 +184,13 @@ private:
     std::string chunkPath(const Variable& v, std::size_t t, std::int64_t k) const;
 
     void addFieldImpl(const FieldDescription& fd, const float* values, std::size_t n,
-                      const std::shared_ptr<const std::vector<float>>& owned);
+                      const std::shared_ptr<std::vector<float>>& owned);
     void writeChunk(const std::string& path, const void* data, std::size_t nbytes);
     void encodeChunk(const std::string& path, bool ensureDir, const float* values, std::size_t nbytes) const;
     void writeShard(const Variable& v, std::size_t t,
                     const std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>& levels);
     void writeArrayMeta(const Variable& v);
+    void ensureQuantizationContainer(const Quantization& q);
     void writeTime(std::size_t t);
     void writeLevel(const Axis& a);
     void writeConsolidated();
@@ -221,6 +225,7 @@ private:
 
     bool finalized_ = false;
     Compression compression_;
+    QuantRules quantize_;
     WorkerPool* pool_ = nullptr;
     mutable DirectoryCache dirs_;  // shared with the compression workers (thread-safe)
 };

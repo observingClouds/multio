@@ -423,6 +423,115 @@ def check_zstd_stores(root, plain):
               f"zstd-load-{ln}: S_VAR0 {v.shape}, NaN count {np.isnan(v).sum()}")
 
 
+# --- quantization before zstd (TestZarr.cc QUANT_RULES, runQuant)
+QUANT_STORES = {"quant-chunk-per-level-t0": "chunk-per-level", "quant-chunk-per-level-t4": "chunk-per-level",
+                "quant-shard-levels-t0": "shard-levels", "quant-shard-levels-t4": "shard-levels"}
+# name -> (container, attributes, error bound of a field e (float64, original float32 values))
+QUANT = {
+    "S_TEMPERATURE": ("quantization_bitround", {"quantization_nsb": 8}, lambda e: np.abs(e) * 2.0 ** -9),
+    "KB_ISOT_ALTIT": ("quantization_absolute", {"quantization_step": 0.25, "quantization_maximum_absolute_error": 0.125},
+                      lambda e: np.full(e.shape, 0.125)),
+    "KT_ISOT_ALTIT": ("quantization_absolute", {"quantization_step": 0.25}, lambda e: np.full(e.shape, 0.125)),
+    "S_HUMI.SPECIFI": ("quantization_range_bits", {"quantization_range_bits": 1}, None),
+    "SURFTEMPERATURE": ("quantization_bitround", {"quantization_nsb": 4}, lambda e: np.abs(e) * 2.0 ** -5),
+    "CLSTEMPERATURE": (None, {}, lambda e: np.zeros(e.shape)),
+    "S_WIND.U.PHYS": ("quantization_bitround", {"quantization_nsb": 12}, lambda e: np.abs(e) * 2.0 ** -13),
+}
+ALGORITHMS = {"quantization_bitround": "bitround", "quantization_absolute": "absolute_power_of_two",
+              "quantization_range_bits": "range_bits_power_of_two"}
+
+
+def pow2floor(x):
+    return 2.0 ** np.floor(np.log2(x))
+
+
+def range_bits_bound(x, n):
+    """D/2 per field (last two axes), D = largest power of two <= (max - min) / 2^n of the field's finite values"""
+    b = np.zeros(x.shape)
+    for idx in np.ndindex(x.shape[:-2]):
+        f = x[idx]
+        ok = np.isfinite(f)
+        if ok.any() and np.ptp(f[ok]) > 0:
+            b[idx] = pow2floor(np.ptp(f[ok].astype(np.float64)) / 2.0 ** n) / 2
+    return b
+
+
+def check_quant_values(label, name, q, x, bound):
+    nan_x, nan_q = np.isnan(x), np.isnan(q)
+    check(np.array_equal(nan_x, nan_q), f"{label}: {name} NaN mask changed")
+    ok = ~nan_x
+    check(np.isfinite(q[ok]).all(), f"{label}: {name} non-finite values")
+    err = np.abs(q.astype(np.float64) - x.astype(np.float64))
+    check((err[ok] <= bound[ok]).all(), f"{label}: {name} error {err[ok].max()} above bound")
+    return int((err[ok] > 0).sum())
+
+
+def check_quant_stores(root):
+    for sub, layout in QUANT_STORES.items():
+        path = os.path.join(root, sub, "TESTDOM.zarr")
+        for consolidated in (True, False):
+            g = zarr.open_group(path, mode="r", use_consolidated=consolidated)
+            names = set(g.array_keys())
+            want = {v[0] for v in VARS} | {"x", "y", "latitude", "longitude", "crs", "time", "level_S", "level_K"} \
+                | set(ALGORITHMS)
+            check(names == want, f"{sub} consolidated={consolidated}: arrays {sorted(names ^ want)}")
+            changed = 0
+            for name, (container, attrs, bound) in QUANT.items():
+                a = g[name]
+                x = expected(name)
+                q = a[...]
+                at = dict(a.attrs)
+                check(at.get("quantization") == container, f"{sub}: {name} quantization {at.get('quantization')}")
+                for k, v in attrs.items():
+                    check(at.get(k) == v, f"{sub}: {name} {k} = {at.get(k)}, expected {v}")
+                b = range_bits_bound(x, 1) if bound is None else bound(x.astype(np.float64))
+                changed += check_quant_values(sub, name, q, x, b)
+                if container is None:
+                    check(bit_equal(q, x), f"{sub}: {name} (lossless rule) differs")
+            check(changed > 0, f"{sub}: nothing quantized")
+            for c, alg in ALGORITHMS.items():
+                check(g[c].shape == () and g[c].attrs.get("algorithm") == alg, f"{sub}: container {c} {dict(g[c].attrs)}")
+        check_zstd_codecs(g, sub, layout == "shard-levels")
+        ds = xr.open_zarr(path, consolidated=True, zarr_format=3)
+        check(ds["S_TEMPERATURE"].attrs.get("quantization_nsb") == 8, f"{sub} xr: attrs {ds['S_TEMPERATURE'].attrs}")
+        ds.close()
+    for layout in ["chunk-per-level", "shard-levels"]:
+        g0 = zarr.open_group(os.path.join(root, f"quant-{layout}-t0", "TESTDOM.zarr"), mode="r")
+        g4 = zarr.open_group(os.path.join(root, f"quant-{layout}-t4", "TESTDOM.zarr"), mode="r")
+        for name in QUANT:
+            check(bit_equal(g0[name][...], g4[name][...]), f"quant-{layout}: threads 0 vs 4 differ for {name}")
+        gp = zarr.open_group(os.path.join(root, f"quant-none-{layout}-plain", "TESTDOM.zarr"), mode="r")
+        for sub in [f"quant-none-{layout}", f"quant-none-{layout}-default"]:
+            gn = zarr.open_group(os.path.join(root, sub, "TESTDOM.zarr"), mode="r")
+            for name, *_ in VARS:
+                check(bit_equal(gn[name][...], gp[name][...]) and "quantization" not in dict(gn[name].attrs),
+                      f"{sub}: {name} differs from plain zstd")
+    # ZarrStore under load: range-bits 10 (S_VAR0/1), absolute 2^-6 (S_VAR2), bitround 9 (default); the lossless
+    # zstd load store has the same fields
+    for ln in ["chunk", "shard"]:
+        ref = zarr.open_group(os.path.join(root, f"zstd-load-{ln}-t0", "LOAD.zarr"), mode="r")
+        g0 = zarr.open_group(os.path.join(root, f"quant-load-{ln}-t0", "LOAD.zarr"), mode="r")
+        g3 = zarr.open_group(os.path.join(root, f"quant-load-{ln}-t3", "LOAD.zarr"), mode="r")
+        changed = 0
+        for n in sorted(ref.array_keys()):
+            if n in ("time",) or n.startswith("level_"):
+                continue
+            x, q = ref[n][...], g3[n][...]
+            check(bit_equal(g0[n][...], q), f"quant-load-{ln}: {n} threads 0 vs 3 differ")
+            if n in ("S_VAR0", "S_VAR1"):
+                b = range_bits_bound(x, 10)
+                check(g3[n].attrs.get("quantization_range_bits") == 10, f"quant-load-{ln}: {n} attrs")
+            elif n == "S_VAR2":
+                b = np.full(x.shape, 2.0 ** -7)
+            else:
+                b = np.abs(x.astype(np.float64)) * 2.0 ** -10
+                check(g3[n].attrs.get("quantization_nsb") == 9, f"quant-load-{ln}: {n} attrs")
+            changed += check_quant_values(f"quant-load-{ln}", n, q, x, b)
+        check(changed > 0, f"quant-load-{ln}: nothing quantized")
+        print(f"quant-load-{ln}: {du(os.path.join(root, f'quant-load-{ln}-t3'))} bytes "
+              f"(lossless zstd {du(os.path.join(root, f'zstd-load-{ln}-t3'))})")
+
+
 def du(path):
     return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(path) for f in fs)
 
@@ -463,6 +572,7 @@ def main():
     check_payload_errors(root)
     check_static_stores(root)
     check_zstd_stores(root, {"chunk-per-level": stores["chunk-per-level"], "shard-levels": stores["shard-levels"]})
+    check_quant_stores(root)
 
     if failures:
         print(f"{len(failures)} FAILURES")

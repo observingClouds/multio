@@ -149,12 +149,32 @@ std::vector<std::int64_t> parseShape(const std::string& raw) {
     return shape;
 }
 
+/// The values to compress: quantized in place in the job's own copy (`owned`), or, inline, in a per-thread
+/// scratch copy (the caller's values are never modified)
+const float* quantizedValues(const Quantization& q, const float* values, std::size_t n, std::vector<float>* owned) {
+    if (!q.enabled()) {
+        return values;
+    }
+    if (owned) {
+        quantize(q, owned->data(), n);
+        return owned->data();
+    }
+    thread_local std::vector<float> scratch;
+    scratch.assign(values, values + n);
+    quantize(q, scratch.data(), n);
+    return scratch.data();
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------------------------------------
 
 ZarrStore::ZarrStore(const StoreSetup& setup) :
-    name_{setup.name}, layout_{setup.layout}, compression_{setup.compression}, pool_{setup.pool} {
+    name_{setup.name},
+    layout_{setup.layout},
+    compression_{setup.compression},
+    quantize_{setup.quantize},
+    pool_{setup.pool} {
     if (!littleEndianHost()) {
         throw eckit::NotImplemented("zarr action: big endian hosts are not supported", Here());
     }
@@ -490,6 +510,9 @@ std::size_t ZarrStore::variableIndex(const FieldDescription& fd) {
     v.is3d = fd.is3d;
     v.gribCode = fd.gribCode;
     v.name = variableName(fd.prefix, fd.suffix, fd.is3d);
+    if (compression_.enabled()) {
+        v.quant = quantize_.lookup(v.name);
+    }
     if (v.is3d) {
         if (fd.prefix.empty()) {
             throw eckit::UserError("zarr action: 3-D field without level type (levtype) in store " + name_, Here());
@@ -507,6 +530,11 @@ std::size_t ZarrStore::variableIndex(const FieldDescription& fd) {
     varByKey_.emplace(std::move(key), idx);
     varByName_.emplace(vars_.back().name, idx);
     dirs_.ensure(varPath(vars_.back()));
+    if (vars_.back().quant.enabled()) {
+        ensureQuantizationContainer(vars_.back().quant);
+        eckit::Log::info() << "zarr action: " << name_ << ": " << vars_.back().name << " quantized, "
+                           << vars_.back().quant.describe() << std::endl;
+    }
     return idx;
 }
 
@@ -563,7 +591,7 @@ void ZarrStore::encodeChunk(const std::string& path, bool ensureDir, const float
 
 void ZarrStore::addField(const FieldDescription& fd, const float* values, std::size_t n) {
     if (encodesAsync()) {
-        addFieldImpl(fd, values, n, std::make_shared<const std::vector<float>>(values, values + n));
+        addFieldImpl(fd, values, n, std::make_shared<std::vector<float>>(values, values + n));
         return;
     }
     addFieldImpl(fd, values, n, nullptr);
@@ -571,16 +599,17 @@ void ZarrStore::addField(const FieldDescription& fd, const float* values, std::s
 
 void ZarrStore::addField(const FieldDescription& fd, std::vector<float>&& values) {
     if (encodesAsync()) {
-        auto owned = std::make_shared<const std::vector<float>>(std::move(values));
+        auto owned = std::make_shared<std::vector<float>>(std::move(values));
         addFieldImpl(fd, owned->data(), owned->size(), owned);
         return;
     }
     addFieldImpl(fd, values.data(), values.size(), nullptr);
 }
 
-/// `owned`: the values as a buffer the compression job keeps alive (set iff encodesAsync())
+/// `owned`: the values as a buffer the compression job keeps alive and may quantize in place (set iff
+/// encodesAsync())
 void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, std::size_t n,
-                             const std::shared_ptr<const std::vector<float>>& owned) {
+                             const std::shared_ptr<std::vector<float>>& owned) {
     if (static_cast<std::int64_t>(n) != nx_ * ny_) {
         std::ostringstream oss;
         oss << "zarr action: field " << fd.prefix << "*" << fd.suffix << " level " << fd.level << " of store "
@@ -596,17 +625,18 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
     }
     const Variable& v = vars_[vi];
     const std::size_t nbytes = n * sizeof(float);
+    const Quantization q = v.quant;  // None unless compressed (quantize needs zstd)
 
     // A chunk file (2-D, chunk-per-level): encoded and written here, or by a worker. The job only uses the path,
     // the owned values, the compression settings and the (thread-safe) directory cache. (A field sent twice for
     // the same step gives two jobs for one file; each write is atomic, but which one lands last is not defined.)
     auto chunkFile = [&](std::string path, bool ensureDir) {
         if (!owned) {
-            encodeChunk(path, ensureDir, values, nbytes);
+            encodeChunk(path, ensureDir, quantizedValues(q, values, n, nullptr), nbytes);
             return;
         }
-        pool_->submit(st.jobs, [this, path = std::move(path), ensureDir, owned, nbytes] {
-            encodeChunk(path, ensureDir, owned->data(), nbytes);
+        pool_->submit(st.jobs, [this, path = std::move(path), ensureDir, owned, nbytes, n, q] {
+            encodeChunk(path, ensureDir, quantizedValues(q, owned->data(), n, owned.get()), nbytes);
         });
     };
 
@@ -640,11 +670,11 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
             slot->assign(b, b + nbytes);
         }
         else if (!owned) {
-            *slot = compressExact(compression_, values, nbytes);
+            *slot = compressExact(compression_, quantizedValues(q, values, n, nullptr), nbytes);
         }
         else {
-            pool_->submit(st.jobs, [this, slot, owned, nbytes] {
-                *slot = compressExact(compression_, owned->data(), nbytes);
+            pool_->submit(st.jobs, [this, slot, owned, nbytes, n, q] {
+                *slot = compressExact(compression_, quantizedValues(q, owned->data(), n, owned.get()), nbytes);
             });
         }
         return;
@@ -839,6 +869,7 @@ std::string ZarrStore::arrayJson(const Variable& v) const {
     if (hasLatLon_) {
         attrs += ",\"grid_mapping\":\"crs\",\"coordinates\":\"latitude longitude\"";
     }
+    attrs += v.quant.attributesJsonTail();
     attrs += "}";
 
     const std::int64_t nt = static_cast<std::int64_t>(times_.size());
@@ -958,6 +989,35 @@ void ZarrStore::writeShard(const Variable& v, std::size_t t,
 void ZarrStore::writeArrayMeta(const Variable& v) {
     dirs_.ensure(varPath(v));
     writeTextAtomic(varPath(v) + "/zarr.json", arrayJson(v));
+}
+
+/// CF container variable of a quantization algorithm: a scalar int32 array without chunks (reads as its fill
+/// value), written once per store and algorithm, like crs
+void ZarrStore::ensureQuantizationContainer(const Quantization& q) {
+    const std::string name = q.containerName();
+    if (std::any_of(staticNodes_.begin(), staticNodes_.end(), [&](const auto& n) { return n.first == name; })) {
+        return;
+    }
+    std::string attrs = "{\"algorithm\":" + jsonString(q.algorithm())
+                      + ",\"implementation\":\"MultIO zarr action (feature/zarr-zstd)\"";
+    switch (q.mode) {
+        case QuantMode::Absolute:
+            attrs += ",\"comment\":\"not a CF algorithm: values rounded to the nearest multiple (ties to even) of "
+                     "quantization_step, a power of two\"";
+            break;
+        case QuantMode::RangeBits:
+            attrs += ",\"comment\":\"not a CF algorithm: per field (time, level) values rounded to the nearest "
+                     "multiple (ties to even) of the largest power of two <= (max - min) / 2^quantization_range_bits "
+                     "of that field\"";
+            break;
+        default:
+            break;
+    }
+    attrs += "}";
+    const std::string doc = arrayDocument({}, "int32", {}, std::string("[") + BYTES_CODEC + "]", attrs, {}, "0");
+    dirs_.ensure(root_ + "/" + name);
+    writeTextAtomic(root_ + "/" + name + "/zarr.json", doc);
+    staticNodes_.emplace_back(name, doc);
 }
 
 void ZarrStore::writeTime(std::size_t t) {

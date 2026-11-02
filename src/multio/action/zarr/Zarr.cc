@@ -320,6 +320,161 @@ Compression parseCompression(const eckit::LocalConfiguration& cfg) {
     return c;
 }
 
+/// One quantization of a rule or of `default`: exactly one of keep-bits, absolute, range-bits, lossless.
+/// `what` names the entry in messages, e.g. "quantize.rules[2]".
+Quantization parseQuantization(const eckit::LocalConfiguration& c, const std::string& what) {
+    Quantization q;
+    int n = 0;
+    auto bitsIn = [&](const std::string& key, int lo, int hi) {
+        if (!c.isIntegral(key)) {
+            throw eckit::UserError("zarr action: '" + what + "." + key + "' must be an integer", Here());
+        }
+        const long long k = c.getLong(key);
+        if (k < lo || k > hi) {
+            throw eckit::UserError("zarr action: '" + what + "." + key + "' is " + std::to_string(k) + ", must be in ["
+                                       + std::to_string(lo) + ", " + std::to_string(hi) + "]",
+                                   Here());
+        }
+        return static_cast<int>(k);
+    };
+    if (c.has("keep-bits")) {
+        ++n;
+        q.mode = QuantMode::BitRound;
+        q.bits = bitsIn("keep-bits", 1, 23);
+    }
+    if (c.has("range-bits")) {
+        ++n;
+        q.mode = QuantMode::RangeBits;
+        q.bits = bitsIn("range-bits", 1, 23);
+    }
+    if (c.has("absolute")) {
+        ++n;
+        double e = 0;
+        if (c.isIntegral("absolute")) {
+            e = static_cast<double>(c.getLong("absolute"));
+        }
+        else if (c.isFloatingPoint("absolute")) {
+            e = c.getDouble("absolute");
+        }
+        else {
+            throw eckit::UserError("zarr action: '" + what + ".absolute' must be a number", Here());
+        }
+        if (!(e > 0) || !std::isfinite(e)) {
+            throw eckit::UserError("zarr action: '" + what + ".absolute' is " + std::to_string(e) + ", must be > 0",
+                                   Here());
+        }
+        // the step must be a normal float32 with a normal reciprocal (exact float32 rounding, see ZarrQuantize.cc)
+        if (e < std::ldexp(1.0, -126) || e >= std::ldexp(1.0, 101)) {
+            std::ostringstream oss;
+            oss << "zarr action: '" << what << ".absolute' is " << e << ", must be in [2^-126, 2^101)";
+            throw eckit::UserError(oss.str(), Here());
+        }
+        q.mode = QuantMode::Absolute;
+        q.requested = e;
+        q.step = powerOfTwoFloor(e);
+    }
+    if (c.has("lossless")) {
+        ++n;
+        if (!c.isBoolean("lossless") || !c.getBool("lossless")) {
+            throw eckit::UserError("zarr action: '" + what + ".lossless' must be true", Here());
+        }
+        q.mode = QuantMode::None;
+    }
+    if (n != 1) {
+        throw eckit::UserError(
+            "zarr action: '" + what + "' needs exactly one of keep-bits, absolute, range-bits, lossless", Here());
+    }
+    return q;
+}
+
+/// `quantize`: {rules: [{variables: <glob or list of globs>, regex: <regex>, <quantization>}, ...],
+///              default: {<quantization>}}
+QuantRules parseQuantize(const eckit::LocalConfiguration& cfg) {
+    QuantRules qr;
+    if (!cfg.has("quantize") || cfg.isNull("quantize")) {
+        return qr;
+    }
+    if (!cfg.isSubConfiguration("quantize")) {
+        throw eckit::UserError("zarr action: 'quantize' must be a map {rules: [...], default: {...}}", Here());
+    }
+    const auto sub = cfg.getSubConfiguration("quantize");
+    for (const auto& k : sub.keys()) {
+        if (k != "rules" && k != "default") {
+            throw eckit::UserError("zarr action: unknown key 'quantize." + k + "' (rules, default)", Here());
+        }
+    }
+    if (sub.has("rules")) {
+        if (!sub.isSubConfigurationList("rules")) {
+            throw eckit::UserError("zarr action: 'quantize.rules' must be a list of maps", Here());
+        }
+        const auto rules = sub.getSubConfigurations("rules");
+        for (std::size_t i = 0; i < rules.size(); ++i) {
+            const auto& r = rules[i];
+            const std::string what = "quantize.rules[" + std::to_string(i) + "]";
+            for (const auto& k : r.keys()) {
+                if (k != "variables" && k != "regex" && k != "keep-bits" && k != "absolute" && k != "range-bits"
+                    && k != "lossless") {
+                    throw eckit::UserError("zarr action: unknown key '" + what + "." + k
+                                               + "' (variables, regex, keep-bits, absolute, range-bits, lossless)",
+                                           Here());
+                }
+            }
+            QuantRule rule;
+            if (r.has("variables")) {
+                if (r.isString("variables")) {
+                    rule.globs.push_back(r.getString("variables"));
+                }
+                else if (r.isStringList("variables")) {
+                    rule.globs = r.getStringVector("variables");
+                }
+                else {
+                    throw eckit::UserError("zarr action: '" + what + ".variables' must be a glob or a list of globs",
+                                           Here());
+                }
+                for (const auto& g : rule.globs) {
+                    if (g.empty()) {
+                        throw eckit::UserError("zarr action: '" + what + ".variables' has an empty pattern", Here());
+                    }
+                }
+            }
+            if (r.has("regex")) {
+                if (!r.isString("regex")) {
+                    throw eckit::UserError("zarr action: '" + what + ".regex' must be a string", Here());
+                }
+                rule.regexText = r.getString("regex");
+                try {
+                    rule.regex = std::make_shared<const std::regex>(rule.regexText, std::regex::ECMAScript);
+                }
+                catch (const std::regex_error& e) {
+                    throw eckit::UserError("zarr action: '" + what + ".regex' '" + rule.regexText
+                                               + "' is not a valid regular expression: " + e.what(),
+                                           Here());
+                }
+            }
+            if (rule.globs.empty() && !rule.regex) {
+                throw eckit::UserError("zarr action: '" + what + "' needs 'variables' or 'regex'", Here());
+            }
+            rule.quantization = parseQuantization(r, what);
+            qr.rules.push_back(std::move(rule));
+        }
+    }
+    if (sub.has("default")) {
+        if (!sub.isSubConfiguration("default")) {
+            throw eckit::UserError("zarr action: 'quantize.default' must be a map, e.g. {keep-bits: 12}", Here());
+        }
+        const auto d = sub.getSubConfiguration("default");
+        for (const auto& k : d.keys()) {
+            if (k != "keep-bits" && k != "absolute" && k != "range-bits" && k != "lossless") {
+                throw eckit::UserError(
+                    "zarr action: unknown key 'quantize.default." + k + "' (keep-bits, absolute, range-bits, lossless)",
+                    Here());
+            }
+        }
+        qr.fallback = parseQuantization(d, "quantize.default");
+    }
+    return qr;
+}
+
 std::size_t parseCount(const eckit::LocalConfiguration& cfg, const std::string& key, std::size_t def,
                        long long maximum) {
     if (!cfg.has(key)) {
@@ -364,6 +519,27 @@ Zarr::Zarr(const ComponentConfiguration& compConf) :
         timestep_ = cfg.getDouble("timestep");
     }
     compression_ = parseCompression(cfg);
+    quantize_ = parseQuantize(cfg);
+    if (!quantize_.empty() && compression_.codec != Codec::Zstd) {
+        // quantized float32 without a compressor is as large as the raw data, and quantization runs in the
+        // compression jobs
+        throw eckit::UserError("zarr action: 'quantize' needs 'compression: {codec: zstd}'", Here());
+    }
+    for (std::size_t i = 0; i < quantize_.rules.size(); ++i) {
+        const auto& r = quantize_.rules[i];
+        std::string pat;
+        for (const auto& g : r.globs) {
+            pat += (pat.empty() ? "" : " ") + g;
+        }
+        if (r.regex) {
+            pat += (pat.empty() ? "regex " : " regex ") + r.regexText;
+        }
+        eckit::Log::info() << "zarr action: quantize rule " << i << ": " << pat << " -> " << r.quantization.describe()
+                           << std::endl;
+    }
+    if (!quantize_.empty()) {
+        eckit::Log::info() << "zarr action: quantize default -> " << quantize_.fallback.describe() << std::endl;
+    }
     compressionThreads_ = parseCount(cfg, "compression-threads", 4, 256);
     compressionQueue_ = parseCount(cfg, "compression-queue", 2 * compressionThreads_, 4096);
     if (compression_.enabled() && compressionThreads_ > 0) {
@@ -425,6 +601,7 @@ ZarrStore& Zarr::store(const std::string& domain, const Message& msg) {
     setup.layout = layout_;
     setup.coordinatesFrom = coordinatesFrom_;
     setup.compression = compression_;
+    setup.quantize = quantize_;
     setup.pool = pool_.get();
     setup.nx = mdInt(md, "geometry-nx");
     setup.ny = mdInt(md, "geometry-ny");

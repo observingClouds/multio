@@ -22,11 +22,21 @@
 ///     compression: {codec: zstd, level: 3}   # optional, default none (or the string none / zstd)
 ///     compression-threads: 4          # compression workers (default 4); 0: compress on the receiving thread
 ///     compression-queue: 8            # fields waiting for a worker before addField blocks (default 2 x threads)
+///     quantize:                       # optional lossy quantization before zstd (needs compression zstd)
+///       rules:                        # ordered, first match on the zarr array name wins
+///         - variables: ["*_TEMPERATURE", CLSTEMPERATURE]   # fnmatch(3) globs; or/and
+///           regex: '^[HPS]_(RAIN|SNOW)$'                  # ECMAScript regex on the whole name
+///           range-bits: 12            # one of: keep-bits: k (bitround, 1..23), absolute: e (step = largest power
+///                                     #   of two <= e), range-bits: n (step = largest power of two <=
+///                                     #   field range / 2^n, per field), lossless: true
+///       default: {keep-bits: 12}      # optional; without it unmatched arrays stay lossless
 ///
 /// Compression (zstd, lossless) applies to the time-dependent arrays: codecs [bytes, zstd] per chunk, and for
 /// shard-levels inside the sharding codec (each inner chunk compressed, the shard index uncompressed). The
 /// workers compress and, for chunk files, write; the receiving thread only copies the field and queues it. A
 /// step flush waits for the jobs of that step, then writes as without compression (see ZarrCodec.h).
+/// Quantization (ZarrQuantize.h) runs in the same jobs, on the worker's copy of the field, just before zstd; the
+/// arrays carry CF-1.11 quantization attributes. Without `quantize` the output is that of lossless zstd.
 ///
 /// It is a terminal action (a sink): it needs the metadata of the message, which plain DataSinks do not get.
 ///
@@ -78,6 +88,7 @@ private:
     std::optional<std::string> coordinatesFrom_;
     std::optional<double> timestep_;
     Compression compression_;
+    QuantRules quantize_;
     std::size_t compressionThreads_ = 4;
     std::size_t compressionQueue_ = 0;
 

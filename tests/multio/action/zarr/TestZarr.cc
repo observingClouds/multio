@@ -25,6 +25,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -38,6 +39,7 @@
 #include "eckit/testing/Test.h"
 
 #include "multio/action/zarr/ZarrCodec.h"
+#include "multio/action/zarr/ZarrQuantize.h"
 #include "multio/action/zarr/ZarrStore.h"
 #include "multio/action/zarr/ZarrUtil.h"
 #include "multio/domain/Mappings.h"
@@ -1681,6 +1683,475 @@ CASE("zstd compression: an error in a worker is rethrown by the flush") {
     }
 }
 
+//----------------------------------------------------------------------------------------------------------------------
+// Quantization before zstd
+
+/// Independent reference of bitround for a normal finite float: x = m 2^e with m in [0.5, 1); keeping k mantissa
+/// bits after the implicit one is rounding m to a multiple of 2^-(k+1), ties to even (double arithmetic)
+float bitRoundReference(float x, int k) {
+    int e = 0;
+    const double m = std::frexp(static_cast<double>(x), &e);
+    return static_cast<float>(std::ldexp(std::nearbyint(std::ldexp(m, k + 1)), e - k - 1));
+}
+
+std::uint32_t bitsOf(float x) {
+    std::uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    return u;
+}
+
+CASE("quantize(): bitround, absolute, range-bits on edge values") {
+    namespace z = multio::action::zarr;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const float fmax = std::numeric_limits<float>::max();
+    const float fmin = std::numeric_limits<float>::min();
+    const float denorm = std::numeric_limits<float>::denorm_min();
+
+    std::vector<float> base = {0.0f,   -0.0f,  1.0f, -1.0f, 1.5f, 0.1f,   -0.1f,      3.14159265f, 287.4567f, -273.15f,
+                               1e-30f, -1e30f, fmax, -fmax, fmin, denorm, 1.9999999f, nan,         inf,       -inf};
+    for (std::uint32_t i = 0; i < 2000; ++i) {  // spread over many binades, both signs
+        const double x = std::ldexp(1.0 + static_cast<double>((i * 2654435761u) % 1000003u) / 1000003.0,
+                                    static_cast<int>(i % 120) - 60);
+        base.push_back(static_cast<float>(i % 2 ? -x : x));
+    }
+    std::uint32_t nanBits = bitsOf(nan);
+
+    // bitround
+    for (int k = 1; k <= 23; ++k) {
+        z::Quantization q;
+        q.mode = z::QuantMode::BitRound;
+        q.bits = k;
+        std::vector<float> v = base;
+        z::quantize(q, v.data(), v.size());
+        const std::uint32_t low = (std::uint32_t{1} << (23 - k)) - 1u;
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const float x = base[i];
+            if (std::isnan(x)) {
+                EXPECT_EQUAL(bitsOf(v[i]), nanBits);
+                continue;
+            }
+            if (std::isinf(x)) {
+                EXPECT(v[i] == x);
+                continue;
+            }
+            EXPECT(std::isfinite(v[i]));             // no overflow to inf (fmax rounds down instead)
+            EXPECT_EQUAL((bitsOf(v[i]) & low), 0u);  // trailing mantissa bits zero
+            EXPECT(std::signbit(v[i]) == std::signbit(x));
+            if (std::fabs(x) >= fmin && std::fabs(x) < fmax / 2) {
+                EXPECT(sameBits(v[i], bitRoundReference(x, k)));
+                EXPECT(std::fabs(static_cast<double>(v[i]) - x) <= std::ldexp(std::fabs(x), -(k + 1)));
+            }
+        }
+        std::vector<float> w = v;  // idempotent
+        z::quantize(q, w.data(), w.size());
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            EXPECT_EQUAL(bitsOf(w[i]), bitsOf(v[i]));
+        }
+    }
+    {  // ties to even: 1 + 2^-23 * (2^22 + odd) patterns on 1.0 .. 2.0 with k = 1: 1.25 -> 1.0, 1.75 -> 2.0
+        z::Quantization q;
+        q.mode = z::QuantMode::BitRound;
+        q.bits = 1;
+        std::vector<float> v = {1.25f, 1.75f, -1.25f, 1.24f};
+        z::quantize(q, v.data(), v.size());
+        EXPECT(v[0] == 1.0f && v[1] == 2.0f && v[2] == -1.0f && v[3] == 1.0f);
+    }
+    // keep-bits 23 is the identity
+    {
+        z::Quantization q;
+        q.mode = z::QuantMode::BitRound;
+        q.bits = 23;
+        std::vector<float> v = base;
+        z::quantize(q, v.data(), v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            EXPECT_EQUAL(bitsOf(v[i]), bitsOf(base[i]));
+        }
+    }
+
+    // powers of two
+    EXPECT(z::powerOfTwoFloor(0.01) == 0.0078125);
+    EXPECT(z::powerOfTwoFloor(1.0) == 1.0);
+    EXPECT(z::powerOfTwoFloor(0.75) == 0.5);
+    EXPECT(z::powerOfTwoFloor(3000.0) == 2048.0);
+
+    // absolute
+    for (double step : {0.125, 1.0, 1024.0, std::ldexp(1.0, -40), std::ldexp(1.0, -126), std::ldexp(1.0, 100)}) {
+        z::Quantization q;
+        q.mode = z::QuantMode::Absolute;
+        q.step = step;
+        std::vector<float> v = base;
+        z::quantize(q, v.data(), v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const float x = base[i];
+            if (std::isnan(x)) {
+                EXPECT_EQUAL(bitsOf(v[i]), nanBits);
+                continue;
+            }
+            if (std::isinf(x)) {
+                EXPECT(v[i] == x);
+                continue;
+            }
+            EXPECT(std::isfinite(v[i]));
+            const double err = std::fabs(static_cast<double>(v[i]) - x);
+            EXPECT(err <= step / 2);
+            const double ref = std::fabs(x) < std::ldexp(step, 24) ? std::nearbyint(x / step) * step : x;
+            EXPECT(static_cast<double>(v[i]) == ref);
+            EXPECT(std::fmod(static_cast<double>(v[i]), step) == 0.0 || v[i] == x);
+        }
+    }
+    {  // ties to even on the multiples: step 0.125
+        z::Quantization q;
+        q.mode = z::QuantMode::Absolute;
+        q.step = 0.125;
+        std::vector<float> v = {0.0625f, 0.1875f, -0.1875f, 0.3125f, 0.06f, -0.0625f};
+        z::quantize(q, v.data(), v.size());
+        EXPECT(v[0] == 0.0f && v[1] == 0.25f && v[2] == -0.25f && v[3] == 0.25f && v[4] == 0.0f && v[5] == 0.0f);
+        EXPECT(std::signbit(v[5]));  // -0.0625 -> -0
+    }
+
+    // range-bits: D = largest power of two <= range / 2^n, per call (field)
+    {
+        z::Quantization q;
+        q.mode = z::QuantMode::RangeBits;
+        q.bits = 4;
+        std::vector<float> v;
+        for (int i = 0; i <= 76; ++i) {
+            v.push_back(-3.0f + 0.1f * static_cast<float>(i));  // range ~7.6 -> D = 0.25
+        }
+        v.push_back(nan);
+        v.push_back(-inf);  // ignored by the range
+        std::vector<float> x = v;
+        z::quantize(q, v.data(), v.size());
+        const double range = static_cast<double>(x[76]) - x[0];
+        const double d = z::powerOfTwoFloor(range / 16);
+        EXPECT(d == 0.25);
+        for (std::size_t i = 0; i <= 76; ++i) {
+            EXPECT(std::fabs(static_cast<double>(v[i]) - x[i]) <= d / 2);
+            EXPECT(std::fmod(static_cast<double>(v[i]), d) == 0.0);
+        }
+        EXPECT(std::isnan(v[77]) && v[78] == -inf);
+
+        std::vector<float> c(10, 287.123f);  // constant: unchanged
+        c[3] = nan;
+        z::quantize(q, c.data(), c.size());
+        EXPECT(c[0] == 287.123f && c[9] == 287.123f && std::isnan(c[3]));
+        std::vector<float> allNan(5, nan);
+        z::quantize(q, allNan.data(), allNan.size());
+        EXPECT(std::isnan(allNan[0]));
+    }
+
+    // rule matching: ordered, first match wins, globs and regex, default
+    z::QuantRules rules;
+    z::QuantRule r1;
+    r1.globs = {"S_*", "CLS?EMPERATURE"};
+    r1.quantization.mode = z::QuantMode::BitRound;
+    r1.quantization.bits = 7;
+    z::QuantRule r2;
+    r2.regexText = "^(S|P)_HUMI\\..*";
+    r2.regex = std::make_shared<const std::regex>(r2.regexText);
+    r2.quantization.mode = z::QuantMode::RangeBits;
+    r2.quantization.bits = 16;
+    rules.rules = {r1, r2};
+    EXPECT(rules.lookup("S_HUMI.SPECIFI").mode == z::QuantMode::BitRound);  // first match wins
+    EXPECT(rules.lookup("P_HUMI.SPECIFI").mode == z::QuantMode::RangeBits);
+    EXPECT(rules.lookup("CLSTEMPERATURE").mode == z::QuantMode::BitRound);
+    EXPECT(rules.lookup("XP_HUMI.SPECIFI").mode == z::QuantMode::None);  // regex matches the whole name
+    EXPECT(rules.lookup("SURFTEMPERATURE").mode == z::QuantMode::None);
+    rules.fallback.mode = z::QuantMode::Absolute;
+    rules.fallback.step = 0.5;
+    EXPECT(rules.lookup("SURFTEMPERATURE").mode == z::QuantMode::Absolute);
+}
+
+/// Quantize rules of the synthetic run (zstd level 5): every algorithm, a glob list, a regex, a lossless rule, a
+/// default. Values are id * 10000 + step * 100 + level + idx * 0.001 (SURFTEMPERATURE idx 7 NaN).
+const std::string QUANT_RULES = R"(, "quantize": {"rules": [)"
+                                R"({"variables": "S_TEMPERATURE", "keep-bits": 8},)"
+                                R"({"variables": ["KB_*", "KT_*"], "absolute": 0.3},)"
+                                R"({"regex": "^S_HUMI\\..*", "range-bits": 1},)"
+                                R"({"variables": "SURFTEMPERATURE", "keep-bits": 4},)"
+                                R"({"variables": "CLS*", "lossless": true}],)"
+                                R"("default": {"keep-bits": 12}})";
+
+Path runQuant(const std::string& layout, int threads, const std::string& sub, const std::string& quant) {
+    const std::string domain = "TESTDOM";
+    const Path root = absolute(outRoot());
+    const Path out = root / sub;
+    const Path coords = root / "coords";
+    removeAll(out);
+    writeCoordinateStore(coords, domain);
+    registerDomain(domain);
+    const std::string extra = R"(, "compression": {"codec": "zstd", "level": 5}, "compression-threads": )"
+                            + std::to_string(threads) + quant;
+    {
+        auto env = MultioTestEnvironment(planJson(out.string(), layout, coords.string(), extra));
+        runSteps(env, domain, "end-of-simulation");
+    }
+    return out / (domain + ".zarr");
+}
+
+/// Expected error bound of QUANT_RULES for variable id at value x (0: exact)
+double quantBound(int id, float x, std::int64_t step, std::int64_t level) {
+    switch (id) {
+        case 1:
+            return std::ldexp(std::fabs(static_cast<double>(x)), -9);  // keep-bits 8
+        case 2:
+        case 3:
+            return 0.25 / 2;  // absolute 0.3 -> D = 0.25
+        case 6: {             // range-bits 1 over the field's range
+            const double lo = static_cast<float>(value(6, step, level, 0));
+            const double hi = static_cast<float>(value(6, step, level, NPTS - 1));
+            return multio::action::zarr::powerOfTwoFloor((hi - lo) / 2) / 2;
+        }
+        case 4:
+            return std::ldexp(std::fabs(static_cast<double>(x)), -5);  // keep-bits 4
+        case 5:
+            return 0.0;  // CLS*: lossless
+        default:
+            return std::ldexp(std::fabs(static_cast<double>(x)), -13);  // default keep-bits 12
+    }
+}
+
+/// Decoded zstd chunk of (id, step, level) within the quantization bounds; returns the number of changed values
+std::size_t checkQuantChunk(const std::vector<float>& vals, int id, std::int64_t step, std::int64_t level) {
+    EXPECT_EQUAL(vals.size(), static_cast<std::size_t>(NPTS));
+    std::size_t changed = 0;
+    for (std::int64_t i = 0; i < NPTS; ++i) {
+        const float x = static_cast<float>(value(id, step, level, i));
+        if (std::isnan(x)) {
+            EXPECT(std::isnan(vals[i]));
+            continue;
+        }
+        EXPECT(std::isfinite(vals[i]));
+        const double err = std::fabs(static_cast<double>(vals[i]) - x);
+        if (err > quantBound(id, x, step, level)) {
+            std::cout << "quantization error " << err << " of variable " << id << " step " << step << " level " << level
+                      << " index " << i << " above " << quantBound(id, x, step, level) << std::endl;
+        }
+        EXPECT(err <= quantBound(id, x, step, level));
+        changed += !sameBits(vals[i], x);
+    }
+    return changed;
+}
+
+CASE("quantize, chunk-per-level: inline and worker threads give the same bytes, error bounds hold") {
+    if (!multio::action::zarr::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    const Path s0 = runQuant("chunk-per-level", 0, "quant-chunk-per-level-t0", QUANT_RULES);
+    const Path s4 = runQuant("chunk-per-level", 4, "quant-chunk-per-level-t4", QUANT_RULES);
+    EXPECT(sameTree(s0, s4));
+    EXPECT_EQUAL(countStaging(s4), 0u);
+
+    // CF quantization attributes and container variables (also in the consolidated metadata)
+    EXPECT(readText(s4 / "S_TEMPERATURE" / "zarr.json")
+               .find(R"("quantization":"quantization_bitround","quantization_nsb":8})")
+           != std::string::npos);
+    EXPECT(readText(s4 / "KB_ISOT_ALTIT" / "zarr.json")
+               .find(R"("quantization":"quantization_absolute","quantization_step":0.25,)"
+                     R"("quantization_maximum_absolute_error":0.125})")
+           != std::string::npos);
+    EXPECT(readText(s4 / "S_HUMI.SPECIFI" / "zarr.json")
+               .find(R"("quantization":"quantization_range_bits","quantization_range_bits":1})")
+           != std::string::npos);
+    EXPECT(readText(s4 / "CLSTEMPERATURE" / "zarr.json").find("quantization") == std::string::npos);
+    EXPECT(readText(s4 / "S_WIND.U.PHYS" / "zarr.json").find(R"("quantization_nsb":12)") != std::string::npos);
+    EXPECT(readText(s4 / "quantization_bitround" / "zarr.json").find(R"("algorithm":"bitround")") != std::string::npos);
+    const std::string rootDoc = readText(s4 / "zarr.json");
+    for (const std::string c : {"quantization_bitround", "quantization_absolute", "quantization_range_bits"}) {
+        EXPECT(rootDoc.find("\"" + c + "\":{\"zarr_format\":3") != std::string::npos);
+    }
+
+    // values within the bounds, NaN kept, quantization visible
+    std::size_t changed = 0;
+    for (std::size_t t = 0; t < STEPS.size(); ++t) {
+        const std::int64_t step = STEPS[t];
+        for (const auto& v : VARS) {
+            if (t < v.firstTime) {
+                continue;
+            }
+            const std::string name = v.id == 7                                      ? "S_WIND.U.PHYS"
+                                   : v.levtype.size() == 1 || v.levtype.size() == 2 ? v.levtype + "_" + v.suffix
+                                                                                    : v.levtype + v.suffix;
+            if (v.levels.empty()) {
+                changed += checkQuantChunk(decodeZstd(readText(s4 / name / "c" / std::to_string(t) / "0" / "0")), v.id,
+                                           step, 0);
+                continue;
+            }
+            const std::vector<std::int64_t> axis = v.levtype == "KB" || v.levtype == "KT"
+                                                     ? std::vector<std::int64_t>{1, 2}
+                                                     : std::vector<std::int64_t>{1, 2, 3};
+            for (auto lev : v.levels) {
+                const auto k = std::find(axis.begin(), axis.end(), lev) - axis.begin();
+                changed += checkQuantChunk(
+                    decodeZstd(readText(s4 / name / "c" / std::to_string(t) / std::to_string(k) / "0" / "0")), v.id,
+                    step, lev);
+            }
+        }
+    }
+    EXPECT(changed > 0);
+    // lossless rule: the CLS chunk is the plain zstd frame of the raw values
+    checkLevelChunk(decodeZstd(readText(s4 / "CLSTEMPERATURE" / "c" / "1" / "0" / "0")), 5, 48, 0);
+    EXPECT(std::isnan(decodeZstd(readText(s4 / "SURFTEMPERATURE" / "c" / "2" / "0" / "0"))[7]));
+}
+
+CASE("quantize, shard-levels: inline and worker threads give the same bytes, error bounds hold") {
+    if (!multio::action::zarr::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    const Path s0 = runQuant("shard-levels", 0, "quant-shard-levels-t0", QUANT_RULES);
+    const Path s4 = runQuant("shard-levels", 4, "quant-shard-levels-t4", QUANT_RULES);
+    EXPECT(sameTree(s0, s4));
+    EXPECT(readText(s4 / "S_TEMPERATURE" / "zarr.json").find(R"("quantization_nsb":8)") != std::string::npos);
+
+    // shard of S_TEMPERATURE at step 48: three frames, each within the bitround bound
+    const std::string b = readText(s4 / "S_TEMPERATURE" / "c" / "1" / "0" / "0" / "0");
+    std::vector<std::uint64_t> idx(6);
+    std::memcpy(idx.data(), b.data() + b.size() - 48, 48);
+    std::size_t changed = 0;
+    for (std::size_t k = 0; k < 3; ++k) {
+        changed += checkQuantChunk(decodeZstd(b.substr(idx[2 * k], idx[2 * k + 1])), 1, 48,
+                                   static_cast<std::int64_t>(k + 1));
+    }
+    EXPECT(changed > 0);
+    const std::string h = readText(s4 / "S_HUMI.SPECIFI" / "c" / "2" / "0" / "0" / "0");
+    std::memcpy(idx.data(), h.data() + h.size() - 48, 48);
+    checkQuantChunk(decodeZstd(h.substr(idx[0], idx[1])), 6, 96, 1);
+    checkQuantChunk(decodeZstd(h.substr(idx[4], idx[5])), 6, 96, 3);
+    EXPECT(std::isnan(decodeZstd(readText(s4 / "SURFTEMPERATURE" / "c" / "0" / "0" / "0"))[7]));
+}
+
+CASE("quantize: only lossless rules give the store of plain zstd, byte for byte") {
+    if (!multio::action::zarr::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    for (const std::string layout : {"chunk-per-level", "shard-levels"}) {
+        const Path plain = runZstd(layout, 2, "quant-none-" + layout + "-plain");
+        const Path q = runQuant(layout, 2, "quant-none-" + layout,
+                                R"(, "quantize": {"rules": [{"variables": "*", "lossless": true}]})");
+        EXPECT(sameTree(plain, q));
+        const Path d = runQuant(layout, 2, "quant-none-" + layout + "-default",
+                                R"(, "quantize": {"default": {"lossless": true}})");
+        EXPECT(sameTree(plain, d));
+    }
+}
+
+/// Larger smooth fields through ZarrStore directly: quantized by the pool (small queue) and inline, same bytes
+CASE("quantize: worker pool under load, ZarrStore directly") {
+    namespace z = multio::action::zarr;
+    if (!z::zstdAvailable()) {
+        std::cout << "built without zstd, skipped" << std::endl;
+        return;
+    }
+    const std::int64_t nx = 211;
+    const std::int64_t ny = 173;
+    auto field = [&](int var, std::int64_t step, std::int64_t lev) {  // as in the zstd load test
+        std::vector<float> v(static_cast<std::size_t>(nx * ny));
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const double x = static_cast<double>(i % nx) / nx;
+            const double y = static_cast<double>(i / nx) / ny;
+            v[i] = static_cast<float>(250.0 + var + 10.0 * std::sin(6.0 * x + lev) * std::cos(4.0 * y + step)
+                                      + 1e-3 * static_cast<double>((i * 2654435761u) % 1000));
+        }
+        if (var == 0) {
+            v[3] = std::numeric_limits<float>::quiet_NaN();
+        }
+        return v;
+    };
+    z::QuantRules rules;
+    z::QuantRule r;
+    r.globs = {"S_VAR0", "S_VAR1"};
+    r.quantization.mode = z::QuantMode::RangeBits;
+    r.quantization.bits = 10;
+    rules.rules.push_back(r);
+    r.globs = {"S_VAR2"};
+    r.quantization.mode = z::QuantMode::Absolute;
+    r.quantization.step = 1.0 / 64;
+    rules.rules.push_back(r);
+    rules.fallback.mode = z::QuantMode::BitRound;
+    rules.fallback.bits = 9;
+    for (const auto layout : {z::Layout::ChunkPerLevel, z::Layout::ShardLevels}) {
+        const std::string ln = layout == z::Layout::ShardLevels ? "shard" : "chunk";
+        std::vector<Path> stores;
+        for (int threads : {0, 3}) {
+            const Path dir = absolute(outRoot()) / ("quant-load-" + ln + "-t" + std::to_string(threads));
+            removeAll(dir);
+            std::unique_ptr<z::WorkerPool> pool;
+            if (threads > 0) {
+                pool = std::make_unique<z::WorkerPool>(threads, 2);
+            }
+            z::StoreSetup setup;
+            setup.name = "LOAD";
+            setup.dir = dir.string();
+            setup.layout = layout;
+            setup.nx = nx;
+            setup.ny = ny;
+            setup.forecastReferenceTime = FRT;
+            setup.compression = z::Compression{z::Codec::Zstd, 1};
+            setup.quantize = rules;
+            setup.pool = pool.get();
+            {
+                z::ZarrStore st(setup);
+                for (std::int64_t step = 0; step < 3; ++step) {
+                    for (int var = 0; var < 6; ++var) {
+                        z::FieldDescription fd;
+                        fd.prefix = var < 4 ? "S" : "SURF";
+                        fd.suffix = "VAR" + std::to_string(var);
+                        fd.is3d = var < 4;
+                        fd.step = step;
+                        fd.leadTime = 3600.0 * step;
+                        for (std::int64_t lev = 1; lev <= (fd.is3d ? 12 : 1); ++lev) {
+                            fd.level = fd.is3d ? lev : 0;
+                            auto v = field(var, step, lev);
+                            if (var % 2) {
+                                st.addField(fd, std::move(v));  // moved: quantized in place by the worker
+                            }
+                            else {
+                                st.addField(fd, v.data(), v.size());  // copied: the caller's values unchanged
+                                EXPECT(sameBits(v[100], field(var, step, lev)[100]));
+                            }
+                        }
+                    }
+                    st.flush(step, std::nullopt);
+                }
+                st.finalize();
+            }
+            stores.push_back(dir / "LOAD.zarr");
+        }
+        EXPECT(sameTree(stores[0], stores[1]));
+        if (layout == z::Layout::ChunkPerLevel) {
+            // range-bits 10 on S_VAR0 (NaN at index 3), absolute 2^-6 on S_VAR2, bitround 9 on the rest
+            for (int var : {0, 2, 4}) {
+                const std::string name = var < 4 ? "S_VAR" + std::to_string(var) : "SURFVAR" + std::to_string(var);
+                const Path chunk = var < 4 ? stores[1] / name / "c" / "2" / "4" / "0" / "0"
+                                           : stores[1] / name / "c" / "2" / "0" / "0";
+                const auto q = decodeZstd(readText(chunk));
+                const auto x = field(var, 2, var < 4 ? 5 : 1);
+                double lo = 1e30;
+                double hi = -1e30;
+                for (float f : x) {
+                    if (std::isfinite(f)) {
+                        lo = std::min(lo, static_cast<double>(f));
+                        hi = std::max(hi, static_cast<double>(f));
+                    }
+                }
+                const double d = var == 0 ? z::powerOfTwoFloor((hi - lo) / 1024) : 1.0 / 64;
+                for (std::size_t i = 0; i < x.size(); ++i) {
+                    if (std::isnan(x[i])) {
+                        EXPECT(std::isnan(q[i]));
+                        continue;
+                    }
+                    const double err = std::fabs(static_cast<double>(q[i]) - x[i]);
+                    EXPECT(err <= (var == 4 ? std::ldexp(std::fabs(static_cast<double>(x[i])), -10) : d / 2));
+                }
+            }
+        }
+    }
+}
+
 CASE("configuration errors") {
     EXPECT_THROWS(MultioTestEnvironment(R"({"name": "z", "actions": [{"type": "zarr"}]})"));
     EXPECT_THROWS(MultioTestEnvironment(R"({"name": "z", "actions": [{"type": "zarr", "path": "x", "format": 2}]})"));
@@ -1721,6 +2192,47 @@ CASE("configuration errors") {
         MultioTestEnvironment(zarrWith(R"(, "compression": {"codec": "zstd", "level": 19}, "compression-threads": 0)"));
         MultioTestEnvironment(zarrWith(R"(, "compression": "zstd")"));
         MultioTestEnvironment(zarrWith(R"(, "compression": {"codec": "none"}, "compression-threads": 8)"));
+
+        // quantize
+        const std::string z = R"(, "compression": "zstd", "quantize": )";
+        expectUserError(R"(, "quantize": {"default": {"keep-bits": 10}})",
+                        "'quantize' needs 'compression: {codec: zstd}'");
+        expectUserError(R"(, "compression": "none", "quantize": {"rules": [{"variables": "*", "keep-bits": 10}]})",
+                        "'quantize' needs 'compression");
+        expectUserError(z + R"([1, 2])", "'quantize' must be a map");
+        expectUserError(z + R"({"rule": []})", "unknown key 'quantize.rule'");
+        expectUserError(z + R"({"rules": {"variables": "*"}})", "'quantize.rules' must be a list of maps");
+        expectUserError(z + R"({"rules": [{"variables": "*", "keepbits": 3}]})",
+                        "unknown key 'quantize.rules[0].keepbits'");
+        expectUserError(z + R"({"rules": [{"variables": "*"}]})", "needs exactly one of keep-bits");
+        expectUserError(z + R"({"rules": [{"variables": "*", "keep-bits": 3, "absolute": 0.1}]})",
+                        "needs exactly one of keep-bits");
+        expectUserError(z + R"({"rules": [{"keep-bits": 3}]})", "'quantize.rules[0]' needs 'variables' or 'regex'");
+        expectUserError(z + R"({"rules": [{"variables": "*", "keep-bits": 0}]})",
+                        "'quantize.rules[0].keep-bits' is 0, must be in [1, 23]");
+        expectUserError(z + R"({"rules": [{"variables": "*", "keep-bits": 24}]})", "keep-bits' is 24");
+        expectUserError(z + R"({"rules": [{"variables": "*", "keep-bits": 2.5}]})", "keep-bits' must be an integer");
+        expectUserError(z + R"({"rules": [{"variables": "*", "range-bits": 30}]})", "range-bits' is 30");
+        expectUserError(z + R"({"rules": [{"variables": "*", "absolute": 0}]})", "'quantize.rules[0].absolute' is 0");
+        expectUserError(z + R"({"rules": [{"variables": "*", "absolute": -0.5}]})", "must be > 0");
+        expectUserError(z + R"({"rules": [{"variables": "*", "absolute": "small"}]})", "absolute' must be a number");
+        expectUserError(z + R"({"rules": [{"variables": "*", "absolute": 1e-50}]})", "must be in [2^-126, 2^101)");
+        expectUserError(z + R"({"rules": [{"variables": "*", "lossless": false}]})", "lossless' must be true");
+        expectUserError(z + R"({"rules": [{"variables": 3, "lossless": true}]})", "must be a glob or a list of globs");
+        expectUserError(z + R"({"rules": [{"variables": "", "lossless": true}]})", "empty pattern");
+        expectUserError(z + R"({"rules": [{"regex": "([", "keep-bits": 4}]})", "is not a valid regular expression");
+        expectUserError(z + R"({"rules": [{"variables": "*", "keep-bits": 4}, {"variables": "*", "range-bits": 0}]})",
+                        "'quantize.rules[1].range-bits' is 0");
+        expectUserError(z + R"({"default": 12})", "'quantize.default' must be a map");
+        expectUserError(z + R"({"default": {"variables": "*", "keep-bits": 4}})",
+                        "unknown key 'quantize.default.variables'");
+        // valid
+        MultioTestEnvironment(
+            zarrWith(z
+                     + R"({"rules": [{"variables": ["H_*", "P_*"], "regex": "^S_.*$", "range-bits": 12},)"
+                       R"({"variables": "CLS*", "absolute": 1}], "default": {"keep-bits": 7}})"));
+        MultioTestEnvironment(zarrWith(z + R"({"rules": []})"));
+        MultioTestEnvironment(zarrWith(R"(, "compression": "none", "quantize": {"rules": []})"));  // empty: lossless
     }
     else {
         expectUserError(R"(, "compression": {"codec": "zstd"})", "built without libzstd");
