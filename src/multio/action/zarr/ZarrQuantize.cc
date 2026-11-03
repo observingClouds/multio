@@ -53,20 +53,17 @@ void bitRound(int keepBits, float* values, std::size_t n) {
 }
 
 /// Round to the nearest multiple of the power of two `step` (normal float32), ties to even. Exact float32
-/// arithmetic: x / step and back are exact scalings, and for |y| < 2^23, (|y| + 2^23) - 2^23 is |y| rounded to an
-/// integer with ties to even (the sum has a unit in the last place of 1).
+/// arithmetic: x / step and back are exact scalings, and nearbyint rounds to an integer with ties to even in the
+/// default rounding mode, keeping the sign of zero. (The (|y| + 2^23) - 2^23 trick is folded away by compilers
+/// with value-unsafe floating-point optimisations, e.g. icpc's default -fp-model fast.)
 void roundToStep(double step, float* values, std::size_t n) {
     const float d = static_cast<float>(step);
     const float inv = static_cast<float>(1.0 / step);
     const float limit = static_cast<float>(std::ldexp(step, 24));  // |x| >= 2^24 D: already a multiple of D
-    const float magic = 8388608.0f;                                // 2^23
     for (std::size_t i = 0; i < n; ++i) {
         const float x = values[i];
         if (std::fabs(x) < limit) {  // false for NaN; true for every finite value if limit is infinite
-            const float y = x * inv;
-            const float a = std::fabs(y);
-            const float r = a < magic ? (a + magic) - magic : a;
-            values[i] = std::copysign(r, y) * d;
+            values[i] = std::nearbyint(x * inv) * d;
         }
     }
 }

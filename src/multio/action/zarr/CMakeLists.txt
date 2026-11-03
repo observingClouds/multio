@@ -64,3 +64,9 @@ ecbuild_add_library(
         ${multio_zarr_zstd_libs}
         Threads::Threads
 )
+
+# The quantization must round exactly (ties to even, error <= half a step): no value-unsafe
+# floating-point optimisations, which icpc/icc enable by default (-fp-model fast=1)
+if( CMAKE_CXX_COMPILER_ID MATCHES "Intel" )
+    set_source_files_properties( ZarrQuantize.cc PROPERTIES COMPILE_OPTIONS "-fp-model=precise" )
+endif()
