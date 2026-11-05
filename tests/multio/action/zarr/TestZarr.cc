@@ -1853,20 +1853,35 @@ CASE("quantize(): bitround, absolute, range-bits on edge values") {
     r2.quantization.mode = z::QuantMode::RangeBits;
     r2.quantization.bits = 16;
     rules.rules = {r1, r2};
-    EXPECT(rules.lookup("S_HUMI.SPECIFI").mode == z::QuantMode::BitRound);  // first match wins
-    EXPECT(rules.lookup("P_HUMI.SPECIFI").mode == z::QuantMode::RangeBits);
-    EXPECT(rules.lookup("CLSTEMPERATURE").mode == z::QuantMode::BitRound);
-    EXPECT(rules.lookup("XP_HUMI.SPECIFI").mode == z::QuantMode::None);  // regex matches the whole name
-    EXPECT(rules.lookup("SURFTEMPERATURE").mode == z::QuantMode::None);
+    EXPECT(rules.lookup("D", "S_HUMI.SPECIFI").mode == z::QuantMode::BitRound);  // first match wins
+    EXPECT(rules.lookup("D", "P_HUMI.SPECIFI").mode == z::QuantMode::RangeBits);
+    EXPECT(rules.lookup("D", "CLSTEMPERATURE").mode == z::QuantMode::BitRound);
+    EXPECT(rules.lookup("D", "XP_HUMI.SPECIFI").mode == z::QuantMode::None);  // regex matches the whole name
+    EXPECT(rules.lookup("D", "SURFTEMPERATURE").mode == z::QuantMode::None);
     rules.fallback.mode = z::QuantMode::Absolute;
     rules.fallback.step = 0.5;
-    EXPECT(rules.lookup("SURFTEMPERATURE").mode == z::QuantMode::Absolute);
+    EXPECT(rules.lookup("D", "SURFTEMPERATURE").mode == z::QuantMode::Absolute);
+
+    // domains: a rule restricted to some stores is skipped for the others
+    z::QuantRule r0;
+    r0.domains = {"PF*", "OTHER"};
+    r0.globs = {"S_*"};
+    r0.quantization.mode = z::QuantMode::RangeBits;
+    r0.quantization.bits = 6;
+    rules.rules = {r0, r1};
+    EXPECT(rules.lookup("PFDEODDOMAIN", "S_TEMPERATURE").mode == z::QuantMode::RangeBits);
+    EXPECT(rules.lookup("OTHER", "S_TEMPERATURE").mode == z::QuantMode::RangeBits);
+    EXPECT(rules.lookup("ICMSHDEOD", "S_TEMPERATURE").mode == z::QuantMode::BitRound);  // next rule
+    EXPECT(rules.lookup("ICMSHDEOD", "SURFTEMPERATURE").mode == z::QuantMode::Absolute);  // default
+    EXPECT(rules.lookup("PFDEODDOMAIN", "SURFTEMPERATURE").mode == z::QuantMode::Absolute);  // domain alone: no match
 }
 
 /// Quantize rules of the synthetic run (zstd level 5): every algorithm, a glob list, a regex, a lossless rule, a
-/// default. Values are id * 10000 + step * 100 + level + idx * 0.001 (SURFTEMPERATURE idx 7 NaN).
+/// default, a rule for other stores only (skipped) and one restricted to this store (store TESTDOM). Values are
+/// id * 10000 + step * 100 + level + idx * 0.001 (SURFTEMPERATURE idx 7 NaN).
 const std::string QUANT_RULES = R"(, "quantize": {"rules": [)"
-                                R"({"variables": "S_TEMPERATURE", "keep-bits": 8},)"
+                                R"({"domains": "OTHER*", "variables": "*", "keep-bits": 1},)"
+                                R"({"domains": ["X", "TEST*"], "variables": "S_TEMPERATURE", "keep-bits": 8},)"
                                 R"({"variables": ["KB_*", "KT_*"], "absolute": 0.3},)"
                                 R"({"regex": "^S_HUMI\\..*", "range-bits": 1},)"
                                 R"({"variables": "SURFTEMPERATURE", "keep-bits": 4},)"
@@ -2220,6 +2235,14 @@ CASE("configuration errors") {
         expectUserError(z + R"({"rules": [{"variables": "*", "lossless": false}]})", "lossless' must be true");
         expectUserError(z + R"({"rules": [{"variables": 3, "lossless": true}]})", "must be a glob or a list of globs");
         expectUserError(z + R"({"rules": [{"variables": "", "lossless": true}]})", "empty pattern");
+        expectUserError(z + R"({"rules": [{"domains": 3, "variables": "*", "lossless": true}]})",
+                        "'quantize.rules[0].domains' must be a glob or a list of globs");
+        expectUserError(z + R"({"rules": [{"domains": "", "variables": "*", "lossless": true}]})",
+                        "'quantize.rules[0].domains' has an empty pattern");
+        expectUserError(z + R"({"rules": [{"domains": [], "variables": "*", "lossless": true}]})",
+                        "'quantize.rules[0].domains' is empty");
+        expectUserError(z + R"({"rules": [{"domains": "PF*", "keep-bits": 4}]})",
+                        "'quantize.rules[0]' needs 'variables' or 'regex'");
         expectUserError(z + R"({"rules": [{"regex": "([", "keep-bits": 4}]})", "is not a valid regular expression");
         expectUserError(z + R"({"rules": [{"variables": "*", "keep-bits": 4}, {"variables": "*", "range-bits": 0}]})",
                         "'quantize.rules[1].range-bits' is 0");

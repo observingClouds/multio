@@ -511,7 +511,7 @@ std::size_t ZarrStore::variableIndex(const FieldDescription& fd) {
     v.gribCode = fd.gribCode;
     v.name = variableName(fd.prefix, fd.suffix, fd.is3d);
     if (compression_.enabled()) {
-        v.quant = quantize_.lookup(v.name);
+        v.quant = quantize_.lookup(name_, v.name);
     }
     if (v.is3d) {
         if (fd.prefix.empty()) {

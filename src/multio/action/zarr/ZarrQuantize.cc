@@ -172,7 +172,16 @@ void quantize(const Quantization& q, float* values, std::size_t n) {
 
 //----------------------------------------------------------------------------------------------------------------------
 
-bool QuantRule::matches(const std::string& name) const {
+bool QuantRule::matches(const std::string& domain, const std::string& name) const {
+    if (!domains.empty()) {
+        bool inDomain = false;
+        for (const auto& d : domains) {
+            inDomain = inDomain || ::fnmatch(d.c_str(), domain.c_str(), 0) == 0;
+        }
+        if (!inDomain) {
+            return false;
+        }
+    }
     for (const auto& g : globs) {
         if (::fnmatch(g.c_str(), name.c_str(), 0) == 0) {
             return true;
@@ -181,9 +190,9 @@ bool QuantRule::matches(const std::string& name) const {
     return regex && std::regex_match(name, *regex);
 }
 
-Quantization QuantRules::lookup(const std::string& name) const {
+Quantization QuantRules::lookup(const std::string& domain, const std::string& name) const {
     for (const auto& r : rules) {
-        if (r.matches(name)) {
+        if (r.matches(domain, name)) {
             return r.quantization;
         }
     }

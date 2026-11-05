@@ -79,12 +79,15 @@ void quantize(const Quantization& q, float* values, std::size_t n);
 
 /// One rule of the `quantize` configuration
 struct QuantRule {
-    std::vector<std::string> globs;  // fnmatch(3) patterns on the zarr array name (any one matches)
-    std::string regexText;           // ECMAScript regex, whole name (std::regex_match); empty: none
+    std::vector<std::string> domains;  // fnmatch(3) patterns on the store (domain) name; empty: every store
+    std::vector<std::string> globs;    // fnmatch(3) patterns on the zarr array name (any one matches)
+    std::string regexText;             // ECMAScript regex, whole name (std::regex_match); empty: none
     std::shared_ptr<const std::regex> regex;
     Quantization quantization;
 
-    bool matches(const std::string& name) const;
+    /// The rule applies to array `name` of store `domain`: the domain matches (or no domain pattern is given) and
+    /// the name matches a glob or the regex
+    bool matches(const std::string& domain, const std::string& name) const;
 };
 
 /// Ordered rules (first match wins) and an optional default for names no rule matches
@@ -94,8 +97,8 @@ struct QuantRules {
 
     bool empty() const { return rules.empty() && !fallback.enabled(); }
 
-    /// Quantization of the array `name`
-    Quantization lookup(const std::string& name) const;
+    /// Quantization of the array `name` of store `domain`
+    Quantization lookup(const std::string& domain, const std::string& name) const;
 };
 
 }  // namespace multio::action::zarr

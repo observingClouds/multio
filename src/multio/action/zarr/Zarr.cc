@@ -387,8 +387,10 @@ Quantization parseQuantization(const eckit::LocalConfiguration& c, const std::st
     return q;
 }
 
-/// `quantize`: {rules: [{variables: <glob or list of globs>, regex: <regex>, <quantization>}, ...],
+/// `quantize`: {rules: [{domains: <glob or list of globs>, variables: <glob or list of globs>, regex: <regex>,
+///                        <quantization>}, ...],
 ///              default: {<quantization>}}
+/// `domains` (optional) restricts a rule to the stores whose domain name matches.
 QuantRules parseQuantize(const eckit::LocalConfiguration& cfg) {
     QuantRules qr;
     if (!cfg.has("quantize") || cfg.isNull("quantize")) {
@@ -412,30 +414,42 @@ QuantRules parseQuantize(const eckit::LocalConfiguration& cfg) {
             const auto& r = rules[i];
             const std::string what = "quantize.rules[" + std::to_string(i) + "]";
             for (const auto& k : r.keys()) {
-                if (k != "variables" && k != "regex" && k != "keep-bits" && k != "absolute" && k != "range-bits"
-                    && k != "lossless") {
-                    throw eckit::UserError("zarr action: unknown key '" + what + "." + k
-                                               + "' (variables, regex, keep-bits, absolute, range-bits, lossless)",
-                                           Here());
+                if (k != "domains" && k != "variables" && k != "regex" && k != "keep-bits" && k != "absolute"
+                    && k != "range-bits" && k != "lossless") {
+                    throw eckit::UserError(
+                        "zarr action: unknown key '" + what + "." + k
+                            + "' (domains, variables, regex, keep-bits, absolute, range-bits, lossless)",
+                        Here());
                 }
             }
             QuantRule rule;
-            if (r.has("variables")) {
-                if (r.isString("variables")) {
-                    rule.globs.push_back(r.getString("variables"));
+            const auto globList = [&](const std::string& key) {
+                std::vector<std::string> globs;
+                if (r.isString(key)) {
+                    globs.push_back(r.getString(key));
                 }
-                else if (r.isStringList("variables")) {
-                    rule.globs = r.getStringVector("variables");
+                else if (r.isStringList(key)) {
+                    globs = r.getStringVector(key);
                 }
                 else {
-                    throw eckit::UserError("zarr action: '" + what + ".variables' must be a glob or a list of globs",
+                    throw eckit::UserError("zarr action: '" + what + "." + key + "' must be a glob or a list of globs",
                                            Here());
                 }
-                for (const auto& g : rule.globs) {
+                for (const auto& g : globs) {
                     if (g.empty()) {
-                        throw eckit::UserError("zarr action: '" + what + ".variables' has an empty pattern", Here());
+                        throw eckit::UserError("zarr action: '" + what + "." + key + "' has an empty pattern", Here());
                     }
                 }
+                return globs;
+            };
+            if (r.has("domains")) {
+                rule.domains = globList("domains");
+                if (rule.domains.empty()) {
+                    throw eckit::UserError("zarr action: '" + what + ".domains' is empty", Here());
+                }
+            }
+            if (r.has("variables")) {
+                rule.globs = globList("variables");
             }
             if (r.has("regex")) {
                 if (!r.isString("regex")) {
@@ -533,6 +547,13 @@ Zarr::Zarr(const ComponentConfiguration& compConf) :
         }
         if (r.regex) {
             pat += (pat.empty() ? "regex " : " regex ") + r.regexText;
+        }
+        if (!r.domains.empty()) {
+            std::string dom;
+            for (const auto& d : r.domains) {
+                dom += (dom.empty() ? "" : " ") + d;
+            }
+            pat += " (domains " + dom + ")";
         }
         eckit::Log::info() << "zarr action: quantize rule " << i << ": " << pat << " -> " << r.quantization.describe()
                            << std::endl;
