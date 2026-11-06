@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <sstream>
 
@@ -172,9 +173,14 @@ const float* quantizedValues(const Quantization& q, const float* values, std::si
 ZarrStore::ZarrStore(const StoreSetup& setup) :
     name_{setup.name},
     layout_{setup.layout},
+    tileSize_{setup.tileSize},
     compression_{setup.compression},
     quantize_{setup.quantize},
     pool_{setup.pool} {
+    if (tileSize_ < 0) {
+        throw eckit::UserError("zarr action: store " + name_ + ": negative tile size " + std::to_string(tileSize_),
+                               Here());
+    }
     if (!littleEndianHost()) {
         throw eckit::NotImplemented("zarr action: big endian hosts are not supported", Here());
     }
@@ -193,7 +199,14 @@ void ZarrStore::createStore(const StoreSetup& setup) {
     makeDirs(root_);
     dirs_.ensure(root_);
 
-    if (pathExists(root_ + "/zarr.json")) {
+    const bool rootExists = pathExists(root_ + "/zarr.json");
+    if (rootExists && tileSize_ > 0) {
+        eckit::Log::info() << "zarr action: tiled store " << root_
+                           << " exists already (written by another server rank, or an earlier run: then stale "
+                              "chunks may remain)"
+                           << std::endl;
+    }
+    else if (rootExists) {
         eckit::Log::warning() << "zarr action: store " << root_
                               << " exists already, it is overwritten array by array (stale chunks may remain)"
                               << std::endl;
@@ -249,6 +262,21 @@ void ZarrStore::createStore(const StoreSetup& setup) {
                               << *sy << " points" << std::endl;
     }
 
+    // Tiles: (Ty, Tx) = (min(T, ny), min(T, nx)); untiled: one tile of the whole grid
+    tileX_ = nx_;
+    tileY_ = ny_;
+    if (tileSize_ > 0) {
+        if (nx_ < 1 || ny_ < 1) {
+            throw eckit::UserError("zarr action: tiled store " + name_ + ": grid " + std::to_string(nx_) + " x "
+                                       + std::to_string(ny_) + " is empty",
+                                   Here());
+        }
+        tileX_ = std::min(tileSize_, nx_);
+        tileY_ = std::min(tileSize_, ny_);
+        ntx_ = (nx_ + tileX_ - 1) / tileX_;
+        nty_ = (ny_ + tileY_ - 1) / tileY_;
+    }
+
     // Reference time and root attributes
     std::string frt;
     std::string srcFrt = srcAttrs.empty() ? std::string() : jsonMember(srcAttrs, "forecast_reference_time");
@@ -281,11 +309,19 @@ void ZarrStore::createStore(const StoreSetup& setup) {
                    + ",\"ny_ci\":" + std::to_string(ny_) + ",\"forecast_reference_time\":" + jsonString(frt) + "}";
     }
 
-    writeConsolidated();
+    // Tiled: another writer of the store may have published steps already; its root stays until this writer
+    // closes a step
+    if (tileSize_ == 0 || !rootExists) {
+        writeConsolidated();
+    }
 
     eckit::Log::info() << "zarr action: created store " << root_ << " (" << nx_ << " x " << ny_ << ", layout "
                        << (layout_ == Layout::ShardLevels ? "shard-levels" : "chunk-per-level") << ", compression "
-                       << compression_.describe() << ", " << staticNodes_.size() << " static arrays copied)" << std::endl;
+                       << compression_.describe() << ", " << staticNodes_.size() << " static arrays copied";
+    if (tileSize_ > 0) {
+        eckit::Log::info() << ", tiles of " << tileY_ << " x " << tileX_ << " points: " << nty_ << " x " << ntx_;
+    }
+    eckit::Log::info() << ")" << std::endl;
 }
 
 void ZarrStore::copyStaticArrays(const std::string& src) {
@@ -418,17 +454,35 @@ void ZarrStore::addStatic(const StaticArray& a, const std::optional<std::string>
     for (std::size_t i = 0; i < a.shape.size(); ++i) {
         chunkRel += "/0";
     }
+    const std::string doc
+        = arrayDocument(a.shape, a.dtype.c_str(), a.shape, std::string("[") + BYTES_CODEC + "]", a.attributes, a.dims,
+                        fill);
+    if (tileSize_ > 0) {
+        // Tiled: the client sends every static array once per tile domain, so one writer gets it several times;
+        // an identical repetition changes nothing and is not written again
+        std::string key = doc;
+        key += '\0';
+        key.append(reinterpret_cast<const char*>(a.data.data()), a.data.size());
+        key += groupAttributes ? "\0" + *groupAttributes : std::string("\1");
+        const std::size_t h = std::hash<std::string>{}(key);
+        auto hit = staticHash_.find(a.name);
+        if (hit != staticHash_.end() && hit->second == h) {
+            LOG_DEBUG_LIB(LibMultio) << "zarr action: " << name_ << ": static array " << a.name
+                                     << " repeated (another tile), unchanged" << std::endl;
+            return;
+        }
+        staticHash_[a.name] = h;
+    }
     if (isDirectory(dir)) {
-        // replaced array (coordinates-from copy, earlier message, earlier run): no stale chunks of another layout
+        // replaced array (coordinates-from copy, earlier message, earlier run): no stale chunks of another layout.
+        // Tiled: other writers may be writing the same array right now, their temporary files are left alone.
         for (const auto& rel : listFilesRecursive(dir)) {
-            if (rel != "zarr.json" && rel != chunkRel) {
+            if (rel != "zarr.json" && rel != chunkRel
+                && !(tileSize_ > 0 && rel.find(".tmp") != std::string::npos)) {
                 removeFile(dir + "/" + rel);
             }
         }
     }
-    const std::string doc
-        = arrayDocument(a.shape, a.dtype.c_str(), a.shape, std::string("[") + BYTES_CODEC + "]", a.attributes, a.dims,
-                        fill);
     writeChunk(dir + "/" + chunkRel, a.data.data(), a.data.size());
     writeTextAtomic(dir + "/zarr.json", doc);
 
@@ -538,8 +592,38 @@ std::size_t ZarrStore::variableIndex(const FieldDescription& fd) {
     return idx;
 }
 
-ZarrStore::OpenStep& ZarrStore::openStep(std::int64_t step) {
-    if (closed_.find(step) != closed_.end()) {
+ZarrStore::OpenStep& ZarrStore::openStep(std::int64_t step, std::int64_t tile) {
+    if (tileSize_ > 0) {
+        auto f = flushedTiles_.find(step);
+        if (f != flushedTiles_.end() && f->second.count(tile) != 0) {
+            std::ostringstream oss;
+            oss << "zarr action: store " << name_ << " tile " << tile << " received a field for step " << step
+                << " after the flush of that step for this tile";
+            throw eckit::UserError(oss.str(), Here());
+        }
+        if (closed_.find(step) != closed_.end()) {
+            // closed before this tile was known to this writer: reopen the step for the tile's chunks
+            auto it = stepTime_.find(step);
+            if (it == stepTime_.end()) {
+                std::ostringstream oss;
+                oss << "zarr action: store " << name_ << " tile " << tile << " received a field for step " << step
+                    << ", which other tiles of this server rank flushed without any field (every field must cover "
+                       "every tile)";
+                throw eckit::UserError(oss.str(), Here());
+            }
+            closed_.erase(step);
+            OpenStep st;
+            st.step = step;
+            st.timeIndex = it->second;
+            st.leadTime = times_.at(it->second);
+            st.reopened = true;
+            st.jobs = std::make_shared<JobGroup>();
+            eckit::Log::info() << "zarr action: " << name_ << ": step " << step << " reopened for tile " << tile
+                               << " (closed before the tile was known to this server rank)" << std::endl;
+            return open_.emplace(it->second, std::move(st)).first->second;
+        }
+    }
+    else if (closed_.find(step) != closed_.end()) {
         std::ostringstream oss;
         oss << "zarr action: store " << name_ << " received a field for step " << step
             << " after that step had been flushed";
@@ -558,7 +642,19 @@ ZarrStore::OpenStep& ZarrStore::openStep(std::int64_t step) {
     return open_.emplace(t, std::move(st)).first->second;
 }
 
-std::string ZarrStore::chunkPath(const Variable& v, std::size_t t, std::int64_t k) const {
+std::string ZarrStore::tileKey(std::int64_t tile) const {
+    return std::to_string(tile / ntx_) + "/" + std::to_string(tile % ntx_);
+}
+
+std::int64_t ZarrStore::tileWidth(std::int64_t tile) const {
+    return std::min(tileX_, nx_ - (tile % ntx_) * tileX_);
+}
+
+std::int64_t ZarrStore::tileHeight(std::int64_t tile) const {
+    return std::min(tileY_, ny_ - (tile / ntx_) * tileY_);
+}
+
+std::string ZarrStore::chunkPath(const Variable& v, std::size_t t, std::int64_t k, std::int64_t tile) const {
     std::string p = varPath(v);
     p += "/c/";
     p += std::to_string(t);
@@ -566,8 +662,31 @@ std::string ZarrStore::chunkPath(const Variable& v, std::size_t t, std::int64_t 
         p += "/";
         p += std::to_string(k);
     }
-    p += "/0/0";
+    p += "/";
+    p += tileKey(tile);
     return p;
+}
+
+void ZarrStore::checkTile(std::int64_t tile, const FieldDescription& fd, std::size_t n) const {
+    auto where = [&]() {
+        std::ostringstream oss;
+        oss << "zarr action: store " << name_ << " tile " << tile << ", field " << fd.prefix << "*" << fd.suffix
+            << " (level " << fd.level << ", step " << fd.step << ")";
+        return oss.str();
+    };
+    if (tile < 0 || tile >= numTiles()) {
+        std::ostringstream oss;
+        oss << where() << ": tile id out of range [0, " << numTiles() << ") (" << nty_ << " x " << ntx_
+            << " tiles of " << tileY_ << " x " << tileX_ << " on " << ny_ << " x " << nx_ << ")";
+        throw eckit::UserError(oss.str(), Here());
+    }
+    const std::int64_t tw = tileWidth(tile);
+    const std::int64_t th = tileHeight(tile);
+    if (static_cast<std::int64_t>(n) != tw * th) {
+        std::ostringstream oss;
+        oss << where() << ": " << n << " values, the tile has tw * th = " << tw << " * " << th;
+        throw eckit::UserError(oss.str(), Here());
+    }
 }
 
 void ZarrStore::writeChunk(const std::string& path, const void* data, std::size_t nbytes) const {
@@ -590,36 +709,101 @@ void ZarrStore::encodeChunk(const std::string& path, bool ensureDir, const float
 }
 
 void ZarrStore::addField(const FieldDescription& fd, const float* values, std::size_t n) {
+    if (tileSize_ > 0) {
+        throw eckit::SeriousBug("zarr action: store " + name_ + " is tiled, fields are added per tile", Here());
+    }
     if (encodesAsync()) {
-        addFieldImpl(fd, values, n, std::make_shared<std::vector<float>>(values, values + n));
+        addFieldImpl(fd, 0, values, n, std::make_shared<std::vector<float>>(values, values + n));
         return;
     }
-    addFieldImpl(fd, values, n, nullptr);
+    addFieldImpl(fd, 0, values, n, nullptr);
 }
 
 void ZarrStore::addField(const FieldDescription& fd, std::vector<float>&& values) {
+    if (tileSize_ > 0) {
+        throw eckit::SeriousBug("zarr action: store " + name_ + " is tiled, fields are added per tile", Here());
+    }
     if (encodesAsync()) {
         auto owned = std::make_shared<std::vector<float>>(std::move(values));
-        addFieldImpl(fd, owned->data(), owned->size(), owned);
+        addFieldImpl(fd, 0, owned->data(), owned->size(), owned);
         return;
     }
-    addFieldImpl(fd, values.data(), values.size(), nullptr);
+    addFieldImpl(fd, 0, values.data(), values.size(), nullptr);
+}
+
+void ZarrStore::addTile(const FieldDescription& fd, std::int64_t tile, const float* values, std::size_t n) {
+    if (tileSize_ == 0) {
+        throw eckit::SeriousBug("zarr action: store " + name_ + " is not tiled", Here());
+    }
+    checkTile(tile, fd, n);
+    const bool edge = tileWidth(tile) != tileX_ || tileHeight(tile) != tileY_;
+    if (encodesAsync() && !edge) {
+        addFieldImpl(fd, tile, values, n, std::make_shared<std::vector<float>>(values, values + n));
+        return;
+    }
+    addFieldImpl(fd, tile, values, n, nullptr);
+}
+
+void ZarrStore::addTile(const FieldDescription& fd, std::int64_t tile, std::vector<float>&& values) {
+    if (tileSize_ == 0) {
+        throw eckit::SeriousBug("zarr action: store " + name_ + " is not tiled", Here());
+    }
+    checkTile(tile, fd, values.size());
+    const bool edge = tileWidth(tile) != tileX_ || tileHeight(tile) != tileY_;
+    if (encodesAsync() && !edge) {
+        auto owned = std::make_shared<std::vector<float>>(std::move(values));
+        addFieldImpl(fd, tile, owned->data(), owned->size(), owned);
+        return;
+    }
+    addFieldImpl(fd, tile, values.data(), values.size(), nullptr);
+}
+
+void ZarrStore::holdTile(std::int64_t tile) {
+    if (tile < 0 || tile >= numTiles()) {
+        std::ostringstream oss;
+        oss << "zarr action: store " << name_ << ": tile id " << tile << " out of range [0, " << numTiles() << ")";
+        throw eckit::UserError(oss.str(), Here());
+    }
+    held_.insert(tile);
 }
 
 /// `owned`: the values as a buffer the compression job keeps alive and may quantize in place (set iff
-/// encodesAsync())
-void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, std::size_t n,
-                             const std::shared_ptr<std::vector<float>>& owned) {
-    if (static_cast<std::int64_t>(n) != nx_ * ny_) {
-        std::ostringstream oss;
-        oss << "zarr action: field " << fd.prefix << "*" << fd.suffix << " level " << fd.level << " of store "
-            << name_ << " has " << n << " values, expected nx*ny = " << nx_ << "*" << ny_;
-        throw eckit::UserError(oss.str(), Here());
+/// encodesAsync(), except for edge tiles, which are padded into a buffer of their own here)
+void ZarrStore::addFieldImpl(const FieldDescription& fd, std::int64_t tile, const float* values, std::size_t n,
+                             std::shared_ptr<std::vector<float>> owned) {
+    std::shared_ptr<std::vector<float>> padded;  // keeps an edge tile's padded values alive for inline encoding
+    if (tileSize_ == 0) {
+        if (static_cast<std::int64_t>(n) != nx_ * ny_) {
+            std::ostringstream oss;
+            oss << "zarr action: field " << fd.prefix << "*" << fd.suffix << " level " << fd.level << " of store "
+                << name_ << " has " << n << " values, expected nx*ny = " << nx_ << "*" << ny_;
+            throw eckit::UserError(oss.str(), Here());
+        }
     }
+    else {
+        // edge tile: pad with the fill value to the full chunk shape (zarr chunks always have the chunk shape)
+        const std::size_t tw = static_cast<std::size_t>(tileWidth(tile));
+        const std::size_t th = static_cast<std::size_t>(tileHeight(tile));
+        const std::size_t tx = static_cast<std::size_t>(tileX_);
+        if (tw != tx || th != static_cast<std::size_t>(tileY_)) {
+            padded = std::make_shared<std::vector<float>>(static_cast<std::size_t>(tileX_ * tileY_),
+                                                          std::numeric_limits<float>::quiet_NaN());
+            for (std::size_t j = 0; j < th; ++j) {
+                std::memcpy(padded->data() + j * tx, values + j * tw, tw * sizeof(float));
+            }
+            values = padded->data();
+            n = padded->size();
+            owned = encodesAsync() ? padded : nullptr;
+        }
+    }
+
     finalized_ = false;
 
     std::size_t vi = variableIndex(fd);
-    OpenStep& st = openStep(fd.step);
+    OpenStep& st = openStep(fd.step, tile);
+    if (tileSize_ > 0) {
+        held_.insert(tile);
+    }
     if (!st.leadTime && fd.leadTime) {
         st.leadTime = fd.leadTime;
     }
@@ -641,7 +825,7 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
     };
 
     if (!v.is3d) {
-        chunkFile(chunkPath(v, st.timeIndex, 0), true);
+        chunkFile(chunkPath(v, st.timeIndex, 0, tile), true);
         return;
     }
 
@@ -664,7 +848,8 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
     if (layout_ == Layout::ShardLevels) {
         // Inner chunk, encoded on arrival. Once the variable has every level of its frozen axis the shard is
         // written right away; otherwise (first step, fewer levels than the axis) at the flush.
-        auto& ss = st.shardStates[vi];
+        const VarTile key{vi, tile};
+        auto& ss = st.shardStates[key];
         if (!ss) {
             ss = std::make_shared<ShardState>();
         }
@@ -676,7 +861,7 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
             return;
         }
         auto slot = std::make_shared<std::vector<unsigned char>>();  // a replaced slot stays alive for its job
-        st.shards[vi][fd.level] = slot;
+        st.shards[key][fd.level] = slot;
         const std::size_t t = st.timeIndex;
         if (!compression_.enabled()) {
             const auto* b = reinterpret_cast<const unsigned char*>(values);
@@ -694,12 +879,13 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
                 }
             });
         }
-        if (a.frozen && st.shards[vi].size() == a.levels.size()) {
+        if (a.frozen && st.shards[key].size() == a.levels.size()) {
             ss->scheduled = true;
-            ss->snapshot = st.shards[vi];
+            ss->snapshot = st.shards[key];
             ss->varDir = varPath(v);
             ss->varName = v.name;
             ss->axisLevels = a.levels;
+            ss->tile = tile;
             if (ss->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 writeEarlyShard(*ss, t);  // every chunk already encoded: write here
             }
@@ -708,7 +894,7 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
     }
 
     if (a.frozen) {
-        chunkFile(chunkPath(v, st.timeIndex, k), true);
+        chunkFile(chunkPath(v, st.timeIndex, k, tile), true);
         return;
     }
 
@@ -716,13 +902,24 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
     // variable's own directory (no shared staging directory, no Lustre directory-lock contention)
     std::string staging
         = varPath(v) + "/.staging_s" + std::to_string(fd.step) + "_L" + std::to_string(fd.level);
-    st.staged[{vi, fd.level}] = staging;
+    if (tileSize_ > 0) {
+        staging += "_T" + std::to_string(tile);
+    }
+    st.staged[{vi, fd.level, tile}] = staging;
     chunkFile(std::move(staging), false);
 }
 
 //----------------------------------------------------------------------------------------------------------------------
 
 void ZarrStore::flush(std::optional<std::int64_t> step, std::optional<double> leadTime) {
+    if (tileSize_ > 0) {
+        // a flush for the whole store: of every held tile
+        const std::set<std::int64_t> held = held_;
+        for (auto tile : held) {
+            flushTile(step, leadTime, tile);
+        }
+        return;
+    }
     if (step) {
         if (closed_.find(*step) != closed_.end()) {
             LOG_DEBUG_LIB(LibMultio) << "zarr action: " << name_ << ": step " << *step << " already flushed"
@@ -746,6 +943,59 @@ void ZarrStore::flush(std::optional<std::int64_t> step, std::optional<double> le
     while (!open_.empty()) {
         closeStep(open_.begin()->second, single ? leadTime : std::nullopt);
     }
+}
+
+bool ZarrStore::allHeldFlushed(std::int64_t step) const {
+    auto f = flushedTiles_.find(step);
+    if (f == flushedTiles_.end()) {
+        return held_.empty();
+    }
+    return std::includes(f->second.begin(), f->second.end(), held_.begin(), held_.end());
+}
+
+std::size_t ZarrStore::flushTile(std::optional<std::int64_t> step, std::optional<double> leadTime,
+                                 std::int64_t tile) {
+    if (tileSize_ == 0) {
+        const std::size_t before = open_.size();
+        flush(step, leadTime);
+        return before - open_.size();
+    }
+    if (!step) {
+        std::vector<std::int64_t> steps;
+        for (const auto& o : open_) {
+            steps.push_back(o.second.step);
+        }
+        std::size_t n = 0;
+        for (auto s : steps) {
+            n += flushTile(s, steps.size() == 1 ? leadTime : std::nullopt, tile);
+        }
+        return n;
+    }
+    flushedTiles_[*step].insert(tile);
+    if (closed_.find(*step) != closed_.end()) {
+        LOG_DEBUG_LIB(LibMultio) << "zarr action: " << name_ << ": step " << *step << " already closed (tile "
+                                 << tile << ")" << std::endl;
+        return 0;
+    }
+    if (!allHeldFlushed(*step)) {
+        LOG_DEBUG_LIB(LibMultio) << "zarr action: " << name_ << ": step " << *step << " flushed by tile " << tile
+                                 << ", waiting for the other tiles of this server rank" << std::endl;
+        return 0;
+    }
+    auto it = stepTime_.find(*step);
+    if (it == stepTime_.end()) {
+        eckit::Log::info() << "zarr action: " << name_ << ": flush for step " << *step
+                           << " without fields, no time step written" << std::endl;
+        closed_.insert(*step);
+        return 0;
+    }
+    closeStep(open_.at(it->second), leadTime);
+    return 1;
+}
+
+bool ZarrStore::endOfSimulationTile(std::int64_t tile) {
+    eosTiles_.insert(tile);
+    return std::includes(eosTiles_.begin(), eosTiles_.end(), held_.begin(), held_.end());
 }
 
 void ZarrStore::closeStep(OpenStep& st, std::optional<double> leadTime) {
@@ -775,9 +1025,9 @@ void ZarrStore::closeStep(OpenStep& st, std::optional<double> leadTime) {
 
     // 2. Move staged chunks to their final keys / write the shards
     for (const auto& s : st.staged) {
-        const Variable& v = vars_[s.first.first];
-        std::int64_t k = axes_[v.axis].index.at(s.first.second);
-        std::string dst = chunkPath(v, t, k);
+        const Variable& v = vars_[std::get<0>(s.first)];
+        std::int64_t k = axes_[v.axis].index.at(std::get<1>(s.first));
+        std::string dst = chunkPath(v, t, k, std::get<2>(s.first));
         dirs_.ensure(dirName(dst));
         renamePath(s.second, dst);
     }
@@ -788,7 +1038,7 @@ void ZarrStore::closeStep(OpenStep& st, std::optional<double> leadTime) {
             ++early;
             continue;
         }
-        writeShard(vars_[sh.first], t, sh.second);
+        writeShard(vars_[sh.first.first], t, sh.first.second, sh.second);
     }
     if (!st.shards.empty()) {
         LOG_DEBUG_LIB(LibMultio) << "zarr action: " << name_ << ": step " << step << ": " << early << " of "
@@ -797,7 +1047,10 @@ void ZarrStore::closeStep(OpenStep& st, std::optional<double> leadTime) {
 
     // 3. Time coordinate value
     double lead;
-    if (leadTime) {
+    if (st.reopened) {
+        lead = times_.at(t);  // published already
+    }
+    else if (leadTime) {
         lead = *leadTime;
     }
     else if (st.leadTime) {
@@ -839,14 +1092,18 @@ void ZarrStore::closeStep(OpenStep& st, std::optional<double> leadTime) {
 
     // 7. Consolidated metadata, then the step marker
     writeConsolidated();
-    writeTextAtomic(root_ + "/.last_step", "step=" + std::to_string(step) + " time_index=" + std::to_string(t)
-                                               + " inc=" + formatInc(lead) + "\n");
+    // tiled: a reopened (earlier) step does not move the marker back
+    if (tileSize_ == 0 || !lastTimeIndex_ || t >= *lastTimeIndex_) {
+        writeTextAtomic(root_ + "/.last_step", "step=" + std::to_string(step) + " time_index=" + std::to_string(t)
+                                                   + " inc=" + formatInc(lead) + "\n");
+        lastStep_ = step;
+        lastTimeIndex_ = t;
+    }
 
     eckit::Log::info() << "zarr action: " << name_ << ": step " << step << " -> time index " << t << ", "
-                       << vars_.size() << " variables" << std::endl;
+                       << vars_.size() << " variables" << (st.reopened ? " (reopened step)" : "") << std::endl;
 
     closed_.insert(step);
-    lastStep_ = step;
     open_.erase(t);  // invalidates st
 }
 
@@ -862,7 +1119,12 @@ void ZarrStore::finalize() {
                 removeFile(s.second);
             }
             nstaged += o.second.staged.size() + o.second.shards.size();
-            stepTime_.erase(o.second.step);
+            if (o.second.reopened) {
+                closed_.insert(o.second.step);  // its time step is published already: keep it
+            }
+            else {
+                stepTime_.erase(o.second.step);
+            }
         }
         eckit::Log::warning() << "zarr action: " << name_ << ": discarding " << open_.size()
                               << " step(s) that were never flushed (" << nstaged << " buffered fields)" << std::endl;
@@ -913,19 +1175,19 @@ std::string ZarrStore::arrayJson(const Variable& v) const {
     const std::string chunkCodecs = std::string("[") + BYTES_CODEC + compression_.codecsJsonTail() + "]";
 
     if (!v.is3d) {
-        return arrayDocument({nt, ny_, nx_}, "float32", {1, ny_, nx_}, chunkCodecs, attrs, {"time", "y", "x"});
+        return arrayDocument({nt, ny_, nx_}, "float32", {1, tileY_, tileX_}, chunkCodecs, attrs, {"time", "y", "x"});
     }
 
     const Axis& a = axes_[v.axis];
     const std::int64_t nlev = static_cast<std::int64_t>(a.levels.size());
     if (layout_ == Layout::ShardLevels) {
         std::string codecs = "[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":"
-                           + jsonIntArray({1, 1, ny_, nx_}) + ",\"codecs\":" + chunkCodecs + ",\"index_codecs\":["
-                           + BYTES_CODEC + "],\"index_location\":\"end\"}}]";
-        return arrayDocument({nt, nlev, ny_, nx_}, "float32", {1, nlev, ny_, nx_}, codecs, attrs,
+                           + jsonIntArray({1, 1, tileY_, tileX_}) + ",\"codecs\":" + chunkCodecs
+                           + ",\"index_codecs\":[" + BYTES_CODEC + "],\"index_location\":\"end\"}}]";
+        return arrayDocument({nt, nlev, ny_, nx_}, "float32", {1, nlev, tileY_, tileX_}, codecs, attrs,
                              {"time", a.dim, "y", "x"});
     }
-    return arrayDocument({nt, nlev, ny_, nx_}, "float32", {1, 1, ny_, nx_}, chunkCodecs, attrs,
+    return arrayDocument({nt, nlev, ny_, nx_}, "float32", {1, 1, tileY_, tileX_}, chunkCodecs, attrs,
                          {"time", a.dim, "y", "x"});
 }
 
@@ -948,31 +1210,39 @@ std::string ZarrStore::rootJson() const {
     j += "{\"zarr_format\":3,\"node_type\":\"group\",\"attributes\":";
     j += rootAttrs_;
     j += ",\"consolidated_metadata\":{\"kind\":\"inline\",\"must_understand\":false,\"metadata\":{";
-    bool first = true;
-    auto add = [&](const std::string& name, const std::string& doc) {
-        if (!first) {
-            j += ',';
-        }
-        first = false;
-        j += jsonString(name);
-        j += ':';
-        j += doc;
-    };
+    // Untiled: static arrays in order of arrival, then the generated nodes in order of publication. Tiled: sorted
+    // by name, the same on every writer of the store whatever order its messages came in.
+    std::vector<std::pair<std::string, std::string>> entries;
+    entries.reserve(staticNodes_.size() + nodes_.size());
     for (const auto& n : staticNodes_) {
-        add(n.first, n.second);
+        entries.emplace_back(n.first, n.second);
     }
     for (const auto& n : nodes_) {
         switch (n.kind) {
             case NodeKind::Variable:
-                add(vars_[n.index].name, arrayJson(vars_[n.index]));
+                entries.emplace_back(vars_[n.index].name, arrayJson(vars_[n.index]));
                 break;
             case NodeKind::Level:
-                add(axes_[n.index].dim, levelJson(axes_[n.index]));
+                entries.emplace_back(axes_[n.index].dim, levelJson(axes_[n.index]));
                 break;
             case NodeKind::Time:
-                add("time", timeJson());
+                entries.emplace_back("time", timeJson());
                 break;
         }
+    }
+    if (tileSize_ > 0) {
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+    bool first = true;
+    for (const auto& e : entries) {
+        if (!first) {
+            j += ',';
+        }
+        first = false;
+        j += jsonString(e.first);
+        j += ':';
+        j += e.second;
     }
     j += "}}}";
     return j;
@@ -980,14 +1250,14 @@ std::string ZarrStore::rootJson() const {
 
 //----------------------------------------------------------------------------------------------------------------------
 
-void ZarrStore::writeShard(const Variable& v, std::size_t t, const LevelChunks& levels) {
-    writeShardFile(varPath(v), v.name, axes_[v.axis].levels, t, levels);
+void ZarrStore::writeShard(const Variable& v, std::size_t t, std::int64_t tile, const LevelChunks& levels) {
+    writeShardFile(varPath(v), v.name, axes_[v.axis].levels, t, tile, levels);
 }
 
 /// Write a shard from a worker (or inline) as soon as its levels are complete, then free its chunks: they are
 /// not needed again, a repeated field for a complete shard is ignored
 void ZarrStore::writeEarlyShard(ShardState& ss, std::size_t t) const {
-    writeShardFile(ss.varDir, ss.varName, ss.axisLevels, t, ss.snapshot);
+    writeShardFile(ss.varDir, ss.varName, ss.axisLevels, t, ss.tile, ss.snapshot);
     for (auto& l : ss.snapshot) {
         std::vector<unsigned char>().swap(*l.second);
     }
@@ -996,10 +1266,10 @@ void ZarrStore::writeEarlyShard(ShardState& ss, std::size_t t) const {
 
 /// Touches no member that the receiving thread changes (vars_, axes_): safe from a worker thread
 void ZarrStore::writeShardFile(const std::string& varDir, const std::string& varName,
-                               const std::vector<std::int64_t>& axisLevels, std::size_t t,
+                               const std::vector<std::int64_t>& axisLevels, std::size_t t, std::int64_t tile,
                                const LevelChunks& levels) const {
     const std::size_t nlev = axisLevels.size();
-    const std::size_t chunkBytes = static_cast<std::size_t>(nx_ * ny_) * sizeof(float);
+    const std::size_t chunkBytes = static_cast<std::size_t>(tileX_ * tileY_) * sizeof(float);
 
     std::size_t total = 0;
     for (const auto& l : levels) {
@@ -1034,7 +1304,7 @@ void ZarrStore::writeShardFile(const std::string& varDir, const std::string& var
     }
     std::memcpy(buf.data() + off, index.data(), index.size() * sizeof(std::uint64_t));
 
-    std::string path = varDir + "/c/" + std::to_string(t) + "/0/0/0";
+    std::string path = varDir + "/c/" + std::to_string(t) + "/0/" + tileKey(tile);
     writeChunk(path, buf.data(), buf.size());
 }
 
@@ -1058,9 +1328,16 @@ void ZarrStore::ensureQuantizationContainer(const Quantization& q) {
                      "quantization_step, a power of two\"";
             break;
         case QuantMode::RangeBits:
-            attrs += ",\"comment\":\"not a CF algorithm: per field (time, level) values rounded to the nearest "
-                     "multiple (ties to even) of the largest power of two <= (max - min) / 2^quantization_range_bits "
-                     "of that field\"";
+            if (tileSize_ > 0) {
+                attrs += ",\"comment\":\"not a CF algorithm: per chunk (time, level, spatial tile) values rounded "
+                         "to the nearest multiple (ties to even) of the largest power of two <= (max - min) / "
+                         "2^quantization_range_bits of that chunk's values\"";
+            }
+            else {
+                attrs += ",\"comment\":\"not a CF algorithm: per field (time, level) values rounded to the nearest "
+                         "multiple (ties to even) of the largest power of two <= (max - min) / "
+                         "2^quantization_range_bits of that field\"";
+            }
             break;
         default:
             break;

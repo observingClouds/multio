@@ -571,7 +571,25 @@ void makeDirs(const std::string& path) {
 
 void writeFileAtomic(const std::string& path, const void* data, std::size_t nbytes) {
     static std::atomic<unsigned long> counter{0};
+    // unique among all writers of a store: several server ranks (also on other hosts, where the pid may be the
+    // same) write the same metadata files of a tiled store
+    static const std::string host = [] {
+        char buf[256] = {0};
+        if (::gethostname(buf, sizeof(buf) - 1) != 0) {
+            return std::string();
+        }
+        std::string h(buf);
+        for (char& c : h) {
+            if (c == '/') {
+                c = '_';
+            }
+        }
+        return h;
+    }();
     std::string tmp = path + ".tmp" + std::to_string(::getpid()) + "_" + std::to_string(counter++);
+    if (!host.empty()) {
+        tmp += "_" + host;
+    }
 
     int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {

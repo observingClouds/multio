@@ -252,6 +252,55 @@ struct Crop {
     std::int64_t y0;  // 1-based
 };
 
+/// Tile keys of a message of a tiled store (zarr-tile-size > 0)
+struct TileInfo {
+    std::string store;  // zarr-store
+    std::int64_t tile;  // zarr-tile
+    std::int64_t size;  // zarr-tile-size
+};
+
+/// The tile keys of a message, or nothing for an untiled message (zarr-tile-size absent or 0). `what` describes
+/// the message in errors.
+std::optional<TileInfo> tileInfo(const Metadata& md, const std::string& what) {
+    if (md.find(std::string("zarr-tile-size")) == md.end()) {
+        return std::nullopt;
+    }
+    const auto size = mdInt(md, "zarr-tile-size");
+    if (!size || *size < 0) {
+        throw eckit::UserError("zarr action: " + what + ": zarr-tile-size '"
+                                   + mdString(md, "zarr-tile-size").value_or("?") + "' is not an integer >= 0",
+                               Here());
+    }
+    if (*size == 0) {
+        return std::nullopt;
+    }
+    TileInfo ti;
+    ti.size = *size;
+    ti.store = trim(mdString(md, "zarr-store").value_or(""));
+    if (ti.store.empty()) {
+        throw eckit::UserError("zarr action: " + what + ": zarr-tile-size " + std::to_string(*size)
+                                   + " but no zarr-store (the store name of a tiled field)",
+                               Here());
+    }
+    const auto tile = mdInt(md, "zarr-tile");
+    if (!tile) {
+        throw eckit::UserError("zarr action: " + what + " of tiled store " + ti.store + ": no zarr-tile (tile id)",
+                               Here());
+    }
+    ti.tile = *tile;
+    // the MultIO domain is <store>#<tile>; a different one would have been aggregated with another tile's map
+    if (auto domain = mdString(md, "domain"); domain && !domain->empty() && *domain != "global") {
+        const std::string want = ti.store + "#" + std::to_string(ti.tile);
+        if (*domain != want) {
+            throw eckit::UserError("zarr action: " + what + " of tiled store " + ti.store + ", tile "
+                                       + std::to_string(ti.tile) + ": domain '" + *domain + "', expected '" + want
+                                       + "'",
+                                   Here());
+        }
+    }
+    return ti;
+}
+
 Layout parseLayout(const std::string& s) {
     if (s == "chunk-per-level") {
         return Layout::ChunkPerLevel;
@@ -610,14 +659,21 @@ void Zarr::executeImpl(Message msg) {
     }
 }
 
-ZarrStore& Zarr::store(const std::string& domain, const Message& msg) {
+ZarrStore& Zarr::store(const std::string& domain, const Message& msg, std::int64_t tileSize) {
     auto it = stores_.find(domain);
     if (it != stores_.end()) {
+        if (it->second->tileSize() != tileSize) {
+            std::ostringstream oss;
+            oss << "zarr action: store " << domain << " has tile size " << it->second->tileSize()
+                << " (0: untiled), a message for it has zarr-tile-size " << tileSize;
+            throw eckit::UserError(oss.str(), Here());
+        }
         return *it->second;
     }
     const auto& md = msg.metadata();
     StoreSetup setup;
     setup.name = domain;
+    setup.tileSize = tileSize;
     setup.dir = path_;
     setup.layout = layout_;
     setup.coordinatesFrom = coordinatesFrom_;
@@ -640,7 +696,8 @@ void Zarr::field(const Message& msg) {
         return;
     }
 
-    auto domain = mdString(md, "domain");
+    const auto ti = tileInfo(md, "field " + mdString(md, "name").value_or(""));
+    auto domain = ti ? std::optional<std::string>(ti->store) : mdString(md, "domain");
     if (!domain || domain->empty()) {
         throw eckit::UserError("zarr action: field without 'domain' (the store name)", Here());
     }
@@ -687,7 +744,13 @@ void Zarr::field(const Message& msg) {
     auto label = [&]() {
         std::ostringstream oss;
         oss << "field " << (name.empty() ? fd.prefix + "*" + fd.suffix : name) << " (level " << fd.level << ", step "
-            << fd.step << ") of domain " << *domain;
+            << fd.step << ")";
+        if (ti) {
+            oss << " of store " << ti->store << " tile " << ti->tile;
+        }
+        else {
+            oss << " of domain " << *domain;
+        }
         return oss.str();
     };
 
@@ -701,6 +764,16 @@ void Zarr::field(const Message& msg) {
     const int ncrop = static_cast<int>(std::count_if(std::begin(cropKeys), std::end(cropKeys),
                                                      [](const auto& k) { return k.has_value(); }));
     std::optional<Crop> crop;
+    if (ti && ncrop != 0) {
+        throw eckit::UserError("zarr action: " + label()
+                                   + " carries crop keys (geometry-nx-full, geometry-ny-full, geometry-x0, "
+                                     "geometry-y0): a tiled field is cropped by the client",
+                               Here());
+    }
+    if (ti && (!gnx || !gny)) {
+        throw eckit::UserError("zarr action: " + label() + " has no geometry-nx/geometry-ny (the store window)",
+                               Here());
+    }
     if (ncrop != 0) {
         if (ncrop != 4) {
             throw eckit::UserError("zarr action: " + label()
@@ -735,7 +808,7 @@ void Zarr::field(const Message& msg) {
         prec = util::PrecisionTag::Float;
     }
 
-    ZarrStore& st = store(*domain, msg);
+    ZarrStore& st = store(*domain, msg, ti ? ti->size : 0);
     if ((gnx && *gnx != st.nx()) || (gny && *gny != st.ny())) {
         std::ostringstream oss;
         oss << "zarr action: " << label() << " has geometry " << gnx.value_or(st.nx()) << " x "
@@ -744,6 +817,16 @@ void Zarr::field(const Message& msg) {
     }
     const std::size_t nx = static_cast<std::size_t>(st.nx());
     const std::size_t ny = static_cast<std::size_t>(st.ny());
+    std::size_t tileValues = 0;  // tiled: tw * th of this tile
+    if (ti) {
+        if (ti->tile < 0 || ti->tile >= st.numTiles()) {
+            std::ostringstream oss;
+            oss << "zarr action: " << label() << ": tile id out of range [0, " << st.numTiles() << ") (tile size "
+                << ti->size << " on " << nx << " x " << ny << ")";
+            throw eckit::UserError(oss.str(), Here());
+        }
+        tileValues = static_cast<std::size_t>(st.tileWidth(ti->tile) * st.tileHeight(ti->tile));
+    }
 
     util::dispatchPrecisionTag(prec, [&](auto pt) {
         using Precision = typename decltype(pt)::type;
@@ -760,11 +843,16 @@ void Zarr::field(const Message& msg) {
                 << *globalSize << " (is there an aggregate action before zarr?)";
             throw eckit::UserError(oss.str(), Here());
         }
-        const std::size_t expected = crop ? static_cast<std::size_t>(crop->nxFull * crop->nyFull) : nx * ny;
+        const std::size_t expected
+            = crop ? static_cast<std::size_t>(crop->nxFull * crop->nyFull) : ti ? tileValues : nx * ny;
         if (n != expected) {
             std::ostringstream oss;
             oss << "zarr action: " << label() << ": payload has " << n << " values, expected ";
-            if (crop) {
+            if (ti) {
+                oss << "tw * th = " << st.tileWidth(ti->tile) << " * " << st.tileHeight(ti->tile)
+                    << " of the tile";
+            }
+            else if (crop) {
                 oss << "geometry-nx-full * geometry-ny-full = " << crop->nxFull << " * " << crop->nyFull;
             }
             else {
@@ -794,7 +882,12 @@ void Zarr::field(const Message& msg) {
             }
         }
         else if constexpr (std::is_same_v<Precision, float>) {
-            st.addField(fd, in, n);  // copied by the store if a worker compresses it
+            if (ti) {
+                st.addTile(fd, ti->tile, in, n);
+            }
+            else {
+                st.addField(fd, in, n);  // copied by the store if a worker compresses it
+            }
             return;
         }
         else {
@@ -803,7 +896,15 @@ void Zarr::field(const Message& msg) {
                 out[i] = static_cast<float>(in[i]);
             }
         }
-        if (async) {
+        if (ti) {
+            if (async) {
+                st.addTile(fd, ti->tile, std::move(fresh));
+            }
+            else {
+                st.addTile(fd, ti->tile, out.data(), out.size());
+            }
+        }
+        else if (async) {
             st.addField(fd, std::move(fresh));
         }
         else {
@@ -815,13 +916,15 @@ void Zarr::field(const Message& msg) {
 void Zarr::staticArray(const Message& msg) {
     const auto& md = msg.metadata();
 
-    auto domain = mdString(md, "domain");
+    const auto ti = tileInfo(md, "static array " + mdString(md, "name").value_or(""));
+    auto domain = ti ? std::optional<std::string>(ti->store) : mdString(md, "domain");
     if (!domain || domain->empty()) {
         throw eckit::UserError("zarr action: static array without 'domain' (the store name)", Here());
     }
     StaticArray a;
     a.name = trim(mdString(md, "name").value_or(""));
-    const std::string label = "static array '" + a.name + "' of domain " + *domain;
+    const std::string label = "static array '" + a.name + "' of "
+                            + (ti ? "store " + ti->store + " tile " + std::to_string(ti->tile) : "domain " + *domain);
     if (a.name.empty()) {
         throw eckit::UserError("zarr action: " + label + ": no 'name'", Here());
     }
@@ -924,7 +1027,7 @@ void Zarr::staticArray(const Message& msg) {
     }
 
     // Store (created from geometry-nx/-ny like for a field); the message's grid must be the store's
-    ZarrStore& st = store(*domain, msg);
+    ZarrStore& st = store(*domain, msg, ti ? ti->size : 0);
     const auto gnx = mdInt(md, "geometry-nx");
     const auto gny = mdInt(md, "geometry-ny");
     if ((gnx && *gnx != st.nx()) || (gny && *gny != st.ny())) {
@@ -933,7 +1036,15 @@ void Zarr::staticArray(const Message& msg) {
             << ", but store " << st.name() << " is " << st.nx() << " x " << st.ny();
         throw eckit::UserError(oss.str(), Here());
     }
+    if (ti && (ti->tile < 0 || ti->tile >= st.numTiles())) {
+        std::ostringstream oss;
+        oss << "zarr action: " << label << ": tile id out of range [0, " << st.numTiles() << ")";
+        throw eckit::UserError(oss.str(), Here());
+    }
     st.addStatic(a, groupAttrs);
+    if (ti) {
+        st.holdTile(ti->tile);
+    }
 }
 
 void Zarr::flush(const Message& msg) {
@@ -974,6 +1085,48 @@ void Zarr::flush(const Message& msg) {
             s.finalize();
         }
     };
+
+    // Tiled stores: a flush per tile domain <store>#<tile>. The step is closed once every tile this action holds
+    // (has received fields or static arrays for) has flushed it, the store finalised once every held tile has sent
+    // end-of-simulation (ZarrStore::flushTile, endOfSimulationTile). A flush for a store without any field or
+    // static array creates no store.
+    if (const auto ti = tileInfo(md, "flush"); ti) {
+        auto it = stores_.find(ti->store);
+        if (it == stores_.end()) {
+            LOG_DEBUG_LIB(LibMultio) << "zarr action: flush for tile " << ti->tile << " of store " << ti->store
+                                     << " without any field" << std::endl;
+            return;
+        }
+        ZarrStore& s = *it->second;
+        if (s.tileSize() != ti->size) {
+            std::ostringstream oss;
+            oss << "zarr action: flush for tile " << ti->tile << " of store " << ti->store << " with zarr-tile-size "
+                << ti->size << ", but the store has tile size " << s.tileSize() << " (0: untiled)";
+            throw eckit::UserError(oss.str(), Here());
+        }
+        if (ti->tile < 0 || ti->tile >= s.numTiles()) {
+            std::ostringstream oss;
+            oss << "zarr action: flush for tile " << ti->tile << " of store " << ti->store
+                << ": tile id out of range [0, " << s.numTiles() << ")";
+            throw eckit::UserError(oss.str(), Here());
+        }
+        if (!closeOnly) {
+            s.flushTile(step, lead, ti->tile);
+        }
+        if (endOfSimulation) {
+            if (s.endOfSimulationTile(ti->tile)) {
+                s.finalize();
+            }
+            else {
+                LOG_DEBUG_LIB(LibMultio) << "zarr action: end-of-simulation of tile " << ti->tile << " of store "
+                                         << ti->store << ", waiting for the other tiles" << std::endl;
+            }
+        }
+        else if (closeOnly && !s.finalized() && !s.hasOpenSteps()) {
+            s.finalize();
+        }
+        return;
+    }
 
     auto domain = mdString(md, "domain");
     if (domain && !domain->empty() && *domain != "global") {

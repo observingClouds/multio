@@ -2372,6 +2372,892 @@ CASE("configuration errors") {
     }
 }
 
+//----------------------------------------------------------------------------------------------------------------------
+// Spatial tiles (zarr-tile-size > 0): the store's window cut into tiles, one MultIO domain <store>#<tile> per tile,
+// every message one tile; several server ranks (action instances) write disjoint tiles of one store
+
+constexpr std::int64_t TNX = 37;
+constexpr std::int64_t TNY = 29;
+constexpr std::int64_t TT = 8;  // 5 x 4 tiles of 8 x 8, the last column 5 wide, the last row 5 high
+const std::vector<std::int64_t> TSTEPS = {0, 24, 48, 96};  // 24: no fields (an empty output step)
+const std::vector<std::int64_t> TFIELD_STEPS = {0, 48, 96};
+
+// The python check has the same table and formula
+const std::vector<Var> TVARS = {
+    {1, "S", "TEMPERATURE", "", {3, 1, 2}, 130, false, 0},
+    {2, "KB", "ISOT_ALTIT", "", {2, 1}, 0, false, 0},
+    {3, "KT", "ISOT_ALTIT", "", {1}, 0, false, 0},  // fewer levels than its axis: missing inner chunks
+    {4, "SURF", "TEMPERATURE", "", {}, 0, false, 0},
+    {5, "CLS", "TEMPERATURE", "", {}, 0, true, 0},
+    {6, "S", "HUMI.SPECIFI", "", {1, 3}, 0, false, 1},  // from the second field step on
+};
+
+double tvalue(int id, std::int64_t step, std::int64_t level, std::int64_t x, std::int64_t y) {
+    if (id == 4 && (x + 3 * y) % 11 == 0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return id * 1000.0 + step * 10.0 + level * 0.5 + x * 0.01 + y * 0.37;
+}
+
+struct TileGeom {
+    std::int64_t x0, y0, tw, th;
+};
+
+/// T = 0: one "tile" covering the window
+std::int64_t tileCount(std::int64_t T) {
+    if (T == 0) {
+        return 1;
+    }
+    const std::int64_t tx = std::min(T, TNX);
+    const std::int64_t ty = std::min(T, TNY);
+    return ((TNX + tx - 1) / tx) * ((TNY + ty - 1) / ty);
+}
+
+TileGeom tileGeom(std::int64_t T, std::int64_t id) {
+    if (T == 0) {
+        return {0, 0, TNX, TNY};
+    }
+    const std::int64_t tx = std::min(T, TNX);
+    const std::int64_t ty = std::min(T, TNY);
+    const std::int64_t ntx = (TNX + tx - 1) / tx;
+    const std::int64_t x0 = (id % ntx) * tx;
+    const std::int64_t y0 = (id / ntx) * ty;
+    return {x0, y0, std::min(tx, TNX - x0), std::min(ty, TNY - y0)};
+}
+
+/// client 0 owns the columns x < 20, client 1 the others: tiles of the third column are shared
+std::size_t tileClientOf(std::int64_t x) {
+    return x < 20 ? 0 : 1;
+}
+
+/// The points (x, y) of client c in tile id, in map order (row by row)
+std::vector<std::pair<std::int64_t, std::int64_t>> tilePoints(std::int64_t T, std::int64_t id, std::size_t c) {
+    const auto g = tileGeom(T, id);
+    std::vector<std::pair<std::int64_t, std::int64_t>> pts;
+    for (std::int64_t y = g.y0; y < g.y0 + g.th; ++y) {
+        for (std::int64_t x = g.x0; x < g.x0 + g.tw; ++x) {
+            if (tileClientOf(x) == c) {
+                pts.emplace_back(x, y);
+            }
+        }
+    }
+    return pts;
+}
+
+std::string tileDomain(const std::string& store, std::int64_t T, std::int64_t id) {
+    return T == 0 ? store : store + "#" + std::to_string(id);
+}
+
+/// Domain maps of every tile domain of the store, for the clients that have points in it
+void registerTiles(const std::string& store, std::int64_t T) {
+    for (std::int64_t id = 0; id < tileCount(T); ++id) {
+        const auto g = tileGeom(T, id);
+        for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+            std::vector<std::int32_t> idx;
+            for (const auto& p : tilePoints(T, id, c)) {
+                idx.push_back(static_cast<std::int32_t>((p.second - g.y0) * g.tw + (p.first - g.x0)));
+            }
+            if (idx.empty()) {
+                continue;
+            }
+            Metadata md;
+            md.set("name", tileDomain(store, T, id));
+            md.set("domain", tileDomain(store, T, id));
+            md.set("category", std::string("ial-domain-map"));
+            md.set("representation", std::string("unstructured"));
+            md.set("misc-globalSize", g.tw * g.th);
+            md.set("toAllServers", true);
+            Message msg{Message::Header{Message::Tag::Domain, CLIENTS[c], SERVER, std::move(md)},
+                        eckit::Buffer(idx.data(), idx.size() * sizeof(std::int32_t))};
+            multio::domain::Mappings::instance().add(std::move(msg));
+        }
+    }
+}
+
+/// Store keys of a message: tiled, the tile keys (zarr-tile-size as int, string or real, depending on the tile)
+void setTileKeys(Metadata& md, const std::string& store, std::int64_t T, std::int64_t id) {
+    md.set("domain", tileDomain(store, T, id));
+    md.set("geometry-nx", TNX);
+    md.set("geometry-ny", TNY);
+    if (T == 0) {
+        return;
+    }
+    md.set("zarr-store", store);
+    md.set("zarr-tile", id);
+    switch (id % 3) {
+        case 0:
+            md.set("zarr-tile-size", T);
+            break;
+        case 1:
+            md.set("zarr-tile-size", std::to_string(T));
+            break;
+        default:
+            md.set("zarr-tile-size", static_cast<double>(T));
+    }
+}
+
+Message tileFieldMessage(const std::string& store, std::int64_t T, std::int64_t id, const Var& v, std::int64_t step,
+                         std::int64_t level, std::size_t c) {
+    const auto g = tileGeom(T, id);
+    Metadata md;
+    md.set("category", std::string("ial-field"));
+    setTileKeys(md, store, T, id);
+    md.set("misc-globalSize", g.tw * g.th);
+    md.set("misc-precision", std::string(v.single ? "single" : "double"));
+    md.set("name", v.levtype + (v.levels.empty() ? "" : std::to_string(level)) + v.suffix);
+    md.set("levtype", v.levtype);
+    md.set("suffix", v.suffix);
+    md.set("levelist", level);
+    md.set("is3d", !v.levels.empty());
+    md.set("grib-code", v.grib);
+    md.set("step", step);
+    md.set("timestep", TIMESTEP);
+    md.set("forecastReferenceTime", FRT);
+    std::vector<double> vals;
+    for (const auto& p : tilePoints(T, id, c)) {
+        vals.push_back(tvalue(v.id, step, level, p.first, p.second));
+    }
+    if (v.single) {
+        std::vector<float> f(vals.begin(), vals.end());
+        return Message{Message::Header{Message::Tag::Field, CLIENTS[c], SERVER, std::move(md)},
+                       eckit::Buffer(f.data(), f.size() * sizeof(float))};
+    }
+    return Message{Message::Header{Message::Tag::Field, CLIENTS[c], SERVER, std::move(md)},
+                   eckit::Buffer(vals.data(), vals.size() * sizeof(double))};
+}
+
+Message tileFlushMessage(const std::string& store, std::int64_t T, std::int64_t id, std::int64_t step,
+                         const std::string& kind, std::size_t c) {
+    Metadata md;
+    setTileKeys(md, store, T, id);
+    md.set("step", step);
+    md.set("flushKind", kind);
+    return Message{Message::Header{Message::Tag::Flush, CLIENTS[c], SERVER, std::move(md)}};
+}
+
+const std::string TGROUP_ATTRS
+    = R"J({"Conventions":"CF-1.8","title":"IAL output, domain TILES","source":"IAL MultIO client (prototype)","forecast_reference_time":")J"
+    + FRT + R"(","nx_ci":37,"ny_ci":29})";
+
+/// The static arrays of the tiled stores: whole arrays, sent by client 0 once per tile domain
+Message tileStaticMessage(const std::string& store, std::int64_t T, std::int64_t id, const std::string& name) {
+    std::vector<double> vals;
+    std::string dims, shape, dtype = "float64", attrs;
+    if (name == "x" || name == "y") {
+        const std::int64_t n = name == "x" ? TNX : TNY;
+        for (std::int64_t i = 0; i < n; ++i) {
+            vals.push_back(2500.0 * i + (name == "y" ? 0.5 : 0.0));
+        }
+        dims = name;
+        shape = std::to_string(n);
+        attrs = name == "x" ? X_ATTRS : Y_ATTRS;
+    }
+    else if (name == "latitude" || name == "longitude") {
+        for (std::int64_t j = 0; j < TNY; ++j) {
+            for (std::int64_t i = 0; i < TNX; ++i) {
+                vals.push_back(name == "latitude" ? 51.0 + 0.0225 * j + 1.0e-4 * i : 4.9 + 0.0361 * i - 2.0e-4 * j);
+            }
+        }
+        dims = "y,x";
+        shape = std::to_string(TNY) + "," + std::to_string(TNX);
+        attrs = name == "latitude" ? LAT_ATTRS : LON_ATTRS;
+    }
+    else {
+        vals.push_back(0.0);
+        dtype = "int32";
+        attrs = CRS_ATTRS;
+    }
+    Metadata md;
+    md.set("category", std::string("ial-static"));
+    setTileKeys(md, store, T, id);
+    md.set("name", name);
+    md.set("skipAggregation", true);
+    md.set("zarr-static", true);
+    md.set("zarr-dimensions", dims);
+    md.set("zarr-shape", shape);
+    md.set("zarr-dtype", dtype);
+    md.set("zarr-attributes", attrs);
+    if (name == "x") {
+        md.set("zarr-group-attributes", TGROUP_ATTRS);
+    }
+    md.set("forecastReferenceTime", FRT);
+    md.set("misc-precision", std::string("double"));
+    md.set("misc-globalSize", static_cast<std::int64_t>(vals.size()));
+    return Message{Message::Header{Message::Tag::Field, CLIENTS[0], SERVER, std::move(md)},
+                   eckit::Buffer(vals.data(), vals.size() * sizeof(double))};
+}
+
+using Event = std::function<Message()>;
+
+/// The messages of one tile domain, by phase: 0 the static arrays, then one phase per output step (the tile's
+/// fields, then its flushes, end-of-simulation for the last step)
+std::vector<std::vector<Event>> tileEvents(const std::string& store, std::int64_t T, std::int64_t id) {
+    std::vector<std::vector<Event>> phases(1 + TSTEPS.size());
+    for (const std::string n : {"x", "y", "latitude", "longitude", "crs"}) {
+        phases[0].push_back([=] { return tileStaticMessage(store, T, id, n); });
+    }
+    std::vector<std::size_t> clients;
+    for (std::size_t c = 0; c < CLIENTS.size(); ++c) {
+        if (!tilePoints(T, id, c).empty()) {
+            clients.push_back(c);
+        }
+    }
+    for (std::size_t s = 0; s < TSTEPS.size(); ++s) {
+        const std::int64_t step = TSTEPS[s];
+        auto fs = std::find(TFIELD_STEPS.begin(), TFIELD_STEPS.end(), step);
+        if (fs != TFIELD_STEPS.end()) {
+            const std::size_t ft = static_cast<std::size_t>(fs - TFIELD_STEPS.begin());
+            for (const auto& v : TVARS) {
+                if (ft < v.firstTime) {
+                    continue;
+                }
+                for (auto lev : v.levels.empty() ? std::vector<std::int64_t>{0} : v.levels) {
+                    for (auto c : clients) {
+                        phases[1 + s].push_back([=] { return tileFieldMessage(store, T, id, v, step, lev, c); });
+                    }
+                }
+            }
+        }
+        const std::string kind = s + 1 == TSTEPS.size() ? "end-of-simulation" : "step";
+        for (auto c : clients) {
+            phases[1 + s].push_back([=] { return tileFlushMessage(store, T, id, step, kind, c); });
+        }
+    }
+    return phases;
+}
+
+/// Delivery orders of the messages of a set of tiles (each tile's own order is kept):
+///   0: phase by phase, the tiles round robin, one message at a time
+///   1: tile by tile, all phases of a tile (the last tile first): the other tiles are unknown when the first one
+///      closes its steps and finalises the store
+///   2: phase by phase, the tiles in a pseudo-random interleaving
+std::vector<Event> deliveryOrder(const std::string& store, std::int64_t T, const std::vector<std::int64_t>& tiles,
+                                 int order) {
+    std::vector<std::vector<std::vector<Event>>> ev;
+    for (auto id : tiles) {
+        ev.push_back(tileEvents(store, T, id));
+    }
+    std::vector<Event> out;
+    const std::size_t nphase = 1 + TSTEPS.size();
+    if (order == 1) {
+        for (std::size_t i = ev.size(); i-- > 0;) {
+            for (auto& ph : ev[i]) {
+                out.insert(out.end(), ph.begin(), ph.end());
+            }
+        }
+        return out;
+    }
+    std::uint32_t rng = 12345;
+    for (std::size_t p = 0; p < nphase; ++p) {
+        std::vector<std::size_t> pos(ev.size(), 0);
+        std::size_t left = 0;
+        for (auto& e : ev) {
+            left += e[p].size();
+        }
+        std::size_t next = 0;
+        while (left > 0) {
+            std::size_t i;
+            if (order == 0) {
+                i = next++ % ev.size();
+            }
+            else {
+                rng = rng * 1103515245u + 12345u;
+                i = (rng >> 8) % ev.size();
+            }
+            if (pos[i] < ev[i][p].size()) {
+                out.push_back(ev[i][p][pos[i]++]);
+                --left;
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<std::int64_t> allTiles(std::int64_t T) {
+    std::vector<std::int64_t> t;
+    for (std::int64_t id = 0; id < tileCount(T); ++id) {
+        t.push_back(id);
+    }
+    return t;
+}
+
+/// One synthetic run of store TILES into <selftest>/<sub>, untiled (T = 0) or tiled, by `writers` action instances
+/// (tile id % writers; writer w gets delivery order w % 3), all writing into the same directory
+Path runTiles(const std::string& sub, const std::string& layout, std::int64_t T, const std::string& extra,
+              int writers = 1) {
+    const std::string store = "TILES";
+    const Path out = absolute(outRoot()) / sub;
+    removeAll(out);
+    registerTiles(store, T);
+    std::vector<std::unique_ptr<MultioTestEnvironment>> envs;
+    std::vector<std::vector<Event>> events;
+    for (int w = 0; w < writers; ++w) {
+        envs.push_back(std::make_unique<MultioTestEnvironment>(planJson(out.string(), layout, "", extra)));
+        std::vector<std::int64_t> mine;
+        for (auto id : allTiles(T)) {
+            if (id % writers == w) {
+                mine.push_back(id);
+            }
+        }
+        events.push_back(deliveryOrder(store, T, mine, writers == 1 ? 0 : w % 3));
+    }
+    // the writers' messages interleaved, as server ranks running at the same time
+    std::vector<std::size_t> pos(writers, 0);
+    for (bool any = true; any;) {
+        any = false;
+        for (int w = 0; w < writers; ++w) {
+            if (pos[w] < events[w].size()) {
+                envs[w]->process(events[w][pos[w]++]());
+                any = true;
+            }
+        }
+    }
+    envs.clear();
+    return out / (store + ".zarr");
+}
+
+std::vector<std::int64_t> parseInts(const std::string& raw) {
+    std::vector<std::int64_t> v;
+    for (const auto& e : multio::action::zarr::jsonArrayElements(raw)) {
+        v.push_back(std::stoll(e));
+    }
+    return v;
+}
+
+/// A minimal zarr v3 reader for the arrays of these stores: one (time, level) plane of an array, from chunk files
+/// or shards (index at the end), raw or zstd, missing chunks as the fill value NaN, edge chunks cropped
+std::vector<float> readPlane(const Path& store, const std::string& name, std::int64_t t, std::int64_t k) {
+    namespace z = multio::action::zarr;
+    const std::string doc = readText(store / name / "zarr.json");
+    const auto shape = parseInts(z::jsonMember(doc, "shape"));
+    const auto chunk
+        = parseInts(z::jsonMember(z::jsonMember(z::jsonMember(doc, "chunk_grid"), "configuration"), "chunk_shape"));
+    const std::string codecs = z::jsonMember(doc, "codecs");
+    const bool sharded = codecs.find("\"sharding_indexed\"") != std::string::npos;
+    const bool zstd = codecs.find("\"zstd\"") != std::string::npos;
+    const std::size_t nd = shape.size();
+    const std::int64_t ny = shape[nd - 2], nx = shape[nd - 1], cy = chunk[nd - 2], cx = chunk[nd - 1];
+    std::vector<float> out(static_cast<std::size_t>(nx * ny), std::numeric_limits<float>::quiet_NaN());
+    for (std::int64_t jy = 0; jy * cy < ny; ++jy) {
+        for (std::int64_t jx = 0; jx * cx < nx; ++jx) {
+            const std::string tile = "/" + std::to_string(jy) + "/" + std::to_string(jx);
+            std::optional<std::string> bytes;
+            if (!sharded) {
+                const Path p = store / name / ("c/" + std::to_string(t) + (nd == 4 ? "/" + std::to_string(k) : "") + tile);
+                if (exists(p)) {
+                    bytes = readText(p);
+                }
+            }
+            else {
+                const Path p = store / name / ("c/" + std::to_string(t) + "/0" + tile);
+                if (exists(p)) {
+                    const std::string b = readText(p);
+                    const std::size_t nlev = static_cast<std::size_t>(chunk[1]);
+                    std::uint64_t idx[2];
+                    std::memcpy(idx, b.data() + b.size() - nlev * 16 + static_cast<std::size_t>(k) * 16, 16);
+                    if (idx[0] != std::numeric_limits<std::uint64_t>::max()) {
+                        bytes = b.substr(idx[0], idx[1]);
+                    }
+                }
+            }
+            if (!bytes) {
+                continue;
+            }
+            std::vector<float> vals;
+            if (zstd) {
+                vals = decodeZstd(*bytes);
+            }
+            else {
+                vals.resize(bytes->size() / sizeof(float));
+                std::memcpy(vals.data(), bytes->data(), vals.size() * sizeof(float));
+            }
+            if (static_cast<std::int64_t>(vals.size()) != cy * cx) {
+                std::cout << name << " chunk c/" << t << "/" << k << tile << ": " << vals.size() << " values, chunk "
+                          << cy << " x " << cx << std::endl;
+                throw std::runtime_error("bad chunk size");
+            }
+            for (std::int64_t y = jy * cy; y < std::min(ny, (jy + 1) * cy); ++y) {
+                for (std::int64_t x = jx * cx; x < std::min(nx, (jx + 1) * cx); ++x) {
+                    out[y * nx + x] = vals[(y - jy * cy) * cx + (x - jx * cx)];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+bool sameOrBothNaN(float a, float b) {
+    return sameBits(a, b) || (std::isnan(a) && std::isnan(b));
+}
+
+/// `tiled` reads like `ref` (untiled): same arrays, values, attributes, shapes, dimensions, root attributes, same
+/// static / coordinate arrays byte for byte; the tiled consolidated metadata is sorted by name
+bool sameContent(const Path& ref, const Path& tiled) {
+    namespace z = multio::action::zarr;
+    bool ok = true;
+    auto fail = [&](const std::string& what) {
+        std::cout << "tiles: " << tiled.string() << " vs " << ref.string() << ": " << what << std::endl;
+        ok = false;
+    };
+    auto nr = consolidatedNames(ref);
+    const auto nt = consolidatedNames(tiled);
+    if (!std::is_sorted(nt.begin(), nt.end())) {
+        fail("consolidated metadata not sorted");
+    }
+    std::sort(nr.begin(), nr.end());
+    if (nr != nt) {
+        fail("other arrays");
+        return false;
+    }
+    if (rootAttributes(ref) != rootAttributes(tiled)) {
+        fail("root attributes");
+    }
+    if (readText(ref / ".last_step") != readText(tiled / ".last_step")) {
+        fail(".last_step");
+    }
+    const std::string cm = z::jsonMember(z::jsonMember(readText(tiled / "zarr.json"), "consolidated_metadata"), "metadata");
+    for (const auto& n : nr) {
+        const std::string dr = readText(ref / n / "zarr.json");
+        const std::string dt = readText(tiled / n / "zarr.json");
+        if (z::jsonMember(cm, n) != dt) {
+            fail(n + ": consolidated metadata differs from zarr.json");
+        }
+        const std::string dims = z::jsonMember(dr, "dimension_names");
+        if (n == "time" || dims.find("\"time\"") == std::string::npos) {
+            if (dr != dt || !sameTree(ref / n, tiled / n)) {
+                fail(n + ": static or coordinate array differs");
+            }
+            continue;
+        }
+        for (const char* m : {"shape", "data_type", "fill_value", "attributes", "dimension_names"}) {
+            if (z::jsonMember(dr, m) != z::jsonMember(dt, m)) {
+                fail(n + ": " + m + " differs");
+            }
+        }
+        const auto shape = parseInts(z::jsonMember(dr, "shape"));
+        const std::int64_t nlev = shape.size() == 4 ? shape[1] : 1;
+        for (std::int64_t t = 0; t < shape[0]; ++t) {
+            for (std::int64_t k = 0; k < nlev; ++k) {
+                const auto a = readPlane(ref, n, t, k);
+                const auto b = readPlane(tiled, n, t, k);
+                std::size_t diff = 0;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    diff += sameOrBothNaN(a[i], b[i]) ? 0 : 1;
+                }
+                if (diff != 0) {
+                    fail(n + " time " + std::to_string(t) + " level index " + std::to_string(k) + ": "
+                         + std::to_string(diff) + " values differ");
+                }
+            }
+        }
+    }
+    return ok;
+}
+
+/// The reference values are the formula's (the untiled store is checked against tvalue)
+std::size_t checkTileReference(const Path& ref) {
+    std::size_t bad = 0;
+    std::size_t nanTotal = 0;
+    for (std::size_t ft = 0; ft < TFIELD_STEPS.size(); ++ft) {
+        for (const auto& v : TVARS) {
+            if (ft < v.firstTime) {
+                continue;
+            }
+            const std::string name = v.levels.empty() ? v.levtype + v.suffix : v.levtype + "_" + v.suffix;
+            for (auto lev : v.levels.empty() ? std::vector<std::int64_t>{0} : v.levels) {
+                const std::int64_t k = v.levels.empty() ? 0 : lev - 1;  // level_S = [1, 2, 3], level_K = [1, 2]
+                const auto p = readPlane(ref, name, static_cast<std::int64_t>(ft), k);
+                for (std::int64_t y = 0; y < TNY; ++y) {
+                    for (std::int64_t x = 0; x < TNX; ++x) {
+                        const float want = static_cast<float>(tvalue(v.id, TFIELD_STEPS[ft], lev, x, y));
+                        nanTotal += std::isnan(want) ? 1 : 0;
+                        if (!sameOrBothNaN(p[y * TNX + x], want)) {
+                            if (bad++ < 5) {
+                                std::cout << "tiles reference: " << name << " time " << ft << " level " << lev
+                                          << " (" << x << ", " << y << "): " << p[y * TNX + x] << ", expected "
+                                          << want << std::endl;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EXPECT(nanTotal > 0);
+    return bad;
+}
+
+/// The variants of the tiled tests: (name, extra zarr configuration)
+std::vector<std::pair<std::string, std::string>> tileVariants() {
+    std::vector<std::pair<std::string, std::string>> v{{"raw", ""}};
+    if (multio::action::zarr::zstdAvailable()) {
+        v.emplace_back("zstd", R"(, "compression": {"codec": "zstd", "level": 3}, "compression-threads": 2)");
+        // bitround works value by value: the tiled store has the same values as the untiled one
+        v.emplace_back("zstd-bitround",
+                       R"(, "compression": "zstd", "compression-threads": 0, "quantize": {"default": {"keep-bits": 9}})");
+    }
+    return v;
+}
+
+CASE("tiles: a tiled store reads like the untiled one (select -> aggregate -> zarr, one tile per domain)") {
+    for (const std::string layout : {"chunk-per-level", "shard-levels"}) {
+        for (const auto& [vname, extra] : tileVariants()) {
+            const std::string sub = layout + "-" + vname;
+            const Path ref = runTiles("tiles-ref-" + sub, layout, 0, extra);
+            const Path tiled = runTiles("tiles-" + sub, layout, TT, extra);
+            if (vname != "zstd-bitround") {  // quantized: the python check applies the error bound
+                const std::size_t bad = checkTileReference(ref);
+                EXPECT_EQUAL(bad, 0u);
+            }
+            EXPECT(sameContent(ref, tiled));
+            EXPECT_EQUAL(countStaging(tiled), 0u);
+            EXPECT_EQUAL(readText(tiled / ".last_step"), std::string("step=96 time_index=2 inc=0002:00:00\n"));
+            EXPECT(readText(tiled / "time" / "zarr.json").find("\"shape\":[3]") != std::string::npos);
+
+            // chunk grid of the tiles, chunk keys c/<t>/<k>/<jy>/<jx> (shards c/<t>/0/<jy>/<jx>)
+            const std::string tdoc = readText(tiled / "S_TEMPERATURE" / "zarr.json");
+            const std::string sdoc = readText(tiled / "SURFTEMPERATURE" / "zarr.json");
+            EXPECT(tdoc.find("\"shape\":[3,3,29,37]") != std::string::npos);
+            EXPECT(sdoc.find("\"chunk_shape\":[1,8,8]") != std::string::npos);
+            const std::size_t raw = 8 * 8 * sizeof(float);
+            if (layout == "chunk-per-level") {
+                EXPECT(tdoc.find("\"chunk_shape\":[1,1,8,8]") != std::string::npos);
+                for (std::int64_t jy = 0; jy < 4; ++jy) {
+                    for (std::int64_t jx = 0; jx < 5; ++jx) {
+                        EXPECT(exists(tiled / "S_TEMPERATURE" / ("c/2/2/" + std::to_string(jy) + "/" + std::to_string(jx))));
+                    }
+                }
+                EXPECT(!exists(tiled / "S_TEMPERATURE" / "c/2/2/4"));
+                EXPECT(!exists(tiled / "KT_ISOT_ALTIT" / "c/0/1/0/0"));
+                if (vname == "raw") {
+                    // edge tile (jy, jx) = (3, 4): 5 x 5 values padded with NaN to 8 x 8
+                    const auto e = readFloats(tiled / "S_TEMPERATURE" / "c/0/0/3/4");
+                    EXPECT_EQUAL(e.size() * sizeof(float), raw);
+                    if (e.size() == 64) {
+                        EXPECT(sameBits(e[0], static_cast<float>(tvalue(1, 0, 1, 32, 24))));
+                        EXPECT(sameBits(e[4 * 8 + 4], static_cast<float>(tvalue(1, 0, 1, 36, 28))));
+                        EXPECT(std::isnan(e[5]) && std::isnan(e[7 * 8 + 7]) && std::isnan(e[5 * 8]));
+                    }
+                }
+            }
+            else {
+                EXPECT(tdoc.find("\"chunk_shape\":[1,3,8,8]") != std::string::npos);
+                EXPECT(tdoc.find("\"sharding_indexed\",\"configuration\":{\"chunk_shape\":[1,1,8,8]")
+                       != std::string::npos);
+                EXPECT(exists(tiled / "S_TEMPERATURE" / "c/1/0/3/4"));
+                EXPECT(!exists(tiled / "S_TEMPERATURE" / "c/1/1"));
+                if (vname == "raw") {
+                    EXPECT_EQUAL(fileSize(tiled / "S_TEMPERATURE" / "c/1/0/3/4"),
+                                 static_cast<std::uintmax_t>(3 * raw + 3 * 16));
+                    EXPECT_EQUAL(fileSize(tiled / "KT_ISOT_ALTIT" / "c/0/0/2/1"),
+                                 static_cast<std::uintmax_t>(raw + 2 * 16));
+                }
+            }
+            if (vname == "raw") {
+                EXPECT_EQUAL(fileSize(tiled / "SURFTEMPERATURE" / "c/2/3/4"), static_cast<std::uintmax_t>(raw));
+            }
+        }
+    }
+}
+
+CASE("tiles: three writers (server ranks) of one store, messages in different orders") {
+    for (const std::string layout : {"chunk-per-level", "shard-levels"}) {
+        for (const auto& [vname, extra] : tileVariants()) {
+            if (vname == "zstd-bitround") {
+                continue;
+            }
+            const std::string sub = layout + "-" + vname;
+            const Path ref = absolute(outRoot()) / ("tiles-ref-" + sub) / "TILES.zarr";
+            if (!exists(ref / "zarr.json")) {
+                runTiles("tiles-ref-" + sub, layout, 0, extra);
+            }
+            const Path shared = runTiles("tiles-mw3-" + sub, layout, TT, extra, 3);
+            EXPECT(sameContent(ref, shared));
+            EXPECT_EQUAL(countStaging(shared), 0u);
+
+            // every writer alone (its own directory) writes the same metadata files as the others
+            std::vector<Path> alone;
+            for (int w = 0; w < 3; ++w) {
+                const Path out = absolute(outRoot()) / ("tiles-mw3-" + sub + "-w" + std::to_string(w));
+                removeAll(out);
+                {
+                    auto env = MultioTestEnvironment(planJson(out.string(), layout, "", extra));
+                    std::vector<std::int64_t> mine;
+                    for (auto id : allTiles(TT)) {
+                        if (id % 3 == w) {
+                            mine.push_back(id);
+                        }
+                    }
+                    for (auto& e : deliveryOrder("TILES", TT, mine, w)) {
+                        env.process(e());
+                    }
+                }
+                alone.push_back(out / "TILES.zarr");
+            }
+            std::vector<std::string> meta = {"zarr.json", ".last_step"};
+            for (const auto& n : consolidatedNames(shared)) {
+                meta.push_back(n + "/zarr.json");
+            }
+            for (const auto& f : meta) {
+                const std::string want = readText(shared / f);
+                for (int w = 0; w < 3; ++w) {
+                    if (readText(alone[w] / f) != want) {
+                        std::cout << "tiles: writer " << w << " writes another " << f << std::endl;
+                        EXPECT(false);
+                    }
+                }
+            }
+            // the coordinates (time, levels, static arrays) are the same files on every writer
+            for (const std::string n : {"time", "level_S", "level_K", "x", "latitude", "crs"}) {
+                for (int w = 0; w < 3; ++w) {
+                    EXPECT(sameTree(alone[w] / n, shared / n));
+                }
+            }
+            // a writer alone has only its tiles: tile 0 is writer 0's, tile 1 writer 1's
+            // (chunk c/<t>/<k>/<jy>/<jx> and shard c/<t>/0/<jy>/<jx> keys coincide here)
+            EXPECT(exists(alone[0] / "S_TEMPERATURE" / "c/0/0/0/0"));
+            EXPECT(!exists(alone[1] / "S_TEMPERATURE" / "c/0/0/0/0"));
+            EXPECT(exists(alone[1] / "S_TEMPERATURE" / "c/0/0/0/1"));
+            EXPECT(!exists(alone[0] / "S_TEMPERATURE" / "c/0/0/0/1"));
+        }
+    }
+}
+
+/// Collect the messages of an exception and its nested ones
+template <typename F>
+std::string errorText(F&& f) {
+    std::string text;
+    std::function<void(const std::exception&)> collect = [&](const std::exception& e) {
+        text += e.what();
+        text += "\n";
+        try {
+            std::rethrow_if_nested(e);
+        }
+        catch (const std::exception& n) {
+            collect(n);
+        }
+        catch (...) {
+        }
+    };
+    try {
+        f();
+    }
+    catch (const std::exception& e) {
+        collect(e);
+        return text.empty() ? std::string("?") : text;
+    }
+    return std::string();
+}
+
+/// A tile message straight to the zarr action (no aggregation): `tweak` changes the metadata
+Message directTile(const std::string& store, std::int64_t id, std::int64_t step, std::int64_t nvals,
+                   const std::function<void(Metadata&)>& tweak = {}) {
+    Metadata md;
+    setTileKeys(md, store, TT, id);
+    md.set("misc-globalSize", nvals);
+    md.set("misc-precision", std::string("double"));
+    md.set("levtype", std::string("SURF"));
+    md.set("suffix", std::string("TEMPERATURE"));
+    md.set("step", step);
+    md.set("timestep", TIMESTEP);
+    md.set("forecastReferenceTime", FRT);
+    if (tweak) {
+        tweak(md);
+    }
+    std::vector<double> vals(static_cast<std::size_t>(nvals), 1.0 + id);
+    return Message{Message::Header{Message::Tag::Field, SERVER, SERVER, std::move(md)},
+                   eckit::Buffer(vals.data(), vals.size() * sizeof(double))};
+}
+
+Message directTileFlush(const std::string& store, std::int64_t id, std::optional<std::int64_t> step,
+                        const std::string& kind, const std::function<void(Metadata&)>& tweak = {}) {
+    Metadata md;
+    setTileKeys(md, store, TT, id);
+    if (step) {
+        md.set("step", *step);
+    }
+    md.set("flushKind", kind);
+    if (tweak) {
+        tweak(md);
+    }
+    return Message{Message::Header{Message::Tag::Flush, SERVER, SERVER, std::move(md)}};
+}
+
+std::string zarrOnlyPlan(const Path& out, const std::string& layout = "chunk-per-level") {
+    return std::string(R"({"name": "z", "actions": [{"type": "zarr", "path": ")") + out.string()
+         + R"(", "layout": ")" + layout + R"("}]})";
+}
+
+CASE("tiles: errors") {
+    const Path out = absolute(outRoot()) / "tiles-errors";
+    removeAll(out);
+    auto env = MultioTestEnvironment(zarrOnlyPlan(out));
+    const std::string st = "TERR";
+    auto expectError = [&](Message&& m, const std::string& what) {
+        const std::string e = errorText([&] { env.process(std::move(m)); });
+        if (e.find(what) == std::string::npos) {
+            std::cout << "expected an error with '" << what << "', got: " << (e.empty() ? "none" : e) << std::endl;
+            EXPECT(false);
+        }
+    };
+    using Md = Metadata;
+    // tile 0: 8 x 8; tile 4: 5 x 8 (last column); tile 19: 5 x 5
+    EXPECT_NO_THROW(env.process(directTile(st, 0, 0, 64)));
+    EXPECT_NO_THROW(env.process(directTile(st, 4, 0, 40)));   // zarr-tile-size as a string
+    EXPECT_NO_THROW(env.process(directTile(st, 19, 0, 25, [](Metadata& m) { m.set("zarr-tile-size", 8.0); })));
+    expectError(directTile(st, 20, 0, 25), "store TERR tile 20: tile id out of range [0, 20)");
+    expectError(directTile(st, -1, 0, 64), "tile -1: tile id out of range");
+    expectError(directTile(st, 3, 0, 63), "field SURF*TEMPERATURE (level 0, step 0) of store TERR tile 3");
+    expectError(directTile(st, 4, 0, 64), "expected tw * th = 5 * 8 of the tile");
+    expectError(directTile(st, 3, 0, 64, [](Md& m) { m.set("misc-globalSize", std::int64_t{63}); }),
+                "misc-globalSize is 63");
+    expectError(directTile(st, 3, 0, 64, [](Md& m) { m.set("geometry-x0", std::int64_t{1}); }), "carries crop keys");
+    expectError(directTile(st, 3, 0, 64,
+                           [](Md& m) {
+                               m.set("geometry-nx-full", TNX + 2);
+                               m.set("geometry-ny-full", TNY + 2);
+                               m.set("geometry-x0", std::int64_t{2});
+                               m.set("geometry-y0", std::int64_t{2});
+                           }),
+                "a tiled field is cropped by the client");
+    expectError(directTile(st, 3, 0, 64, [](Md& m) { m.set("zarr-tile-size", std::int64_t{16}); }),
+                "store TERR has tile size 8 (0: untiled), a message for it has zarr-tile-size 16");
+    expectError(directTile(st, 3, 0, 64, [](Md& m) { m.set("geometry-nx", TNX + 1); }), "but store TERR is 37 x 29");
+    expectError(directTile(st, 3, 0, 64, [](Md& m) { m.set("zarr-store", std::string("")); }), "no zarr-store");
+    expectError(directTile(st, 3, 0, 64, [](Md& m) { m.set("zarr-tile-size", std::string("eight")); }),
+                "zarr-tile-size 'eight' is not an integer");
+    expectError(directTile(st, 3, 0, 64, [](Md& m) { m.set("domain", std::string("TERR#2")); }),
+                "domain 'TERR#2', expected 'TERR#3'");
+    {
+        Metadata md;
+        md.set("zarr-store", st);
+        md.set("zarr-tile-size", TT);
+        md.set("domain", std::string("TERR#3"));
+        Message m{Message::Header{Message::Tag::Field, SERVER, SERVER, std::move(md)}, eckit::Buffer(8)};
+        expectError(std::move(m), "no zarr-tile (tile id)");
+    }
+    // an untiled message for the tiled store
+    expectError(directTile(st, 3, 0, TNX * TNY,
+                           [&](Md& m) {
+                               m.set("zarr-tile-size", std::int64_t{0});
+                               m.set("domain", st);
+                           }),
+                "store TERR has tile size 8 (0: untiled), a message for it has zarr-tile-size 0");
+    expectError(directTileFlush(st, 25, 0, "step"), "flush for tile 25 of store TERR: tile id out of range");
+    expectError(directTileFlush(st, 3, 0, "step", [](Md& m) { m.set("zarr-tile-size", std::int64_t{4}); }),
+                "with zarr-tile-size 4, but the store has tile size 8");
+    // the valid ones were written
+    EXPECT_NO_THROW(env.process(directTileFlush(st, 0, 0, "step")));
+    EXPECT_NO_THROW(env.process(directTileFlush(st, 4, 0, "step")));
+    EXPECT_NO_THROW(env.process(directTileFlush(st, 19, 0, "end-of-simulation")));
+    const Path s = out / "TERR.zarr";
+    EXPECT_EQUAL(readText(s / ".last_step"), std::string("step=0 time_index=0 inc=0000:00:00\n"));
+    EXPECT(exists(s / "SURFTEMPERATURE" / "c/0/0/0"));
+    EXPECT(exists(s / "SURFTEMPERATURE" / "c/0/0/4"));
+    EXPECT(exists(s / "SURFTEMPERATURE" / "c/0/3/4"));
+    EXPECT(!exists(s / "SURFTEMPERATURE" / "c/0/0/3"));
+    EXPECT_EQUAL(countStaging(s), 0u);
+}
+
+CASE("tiles: a step is closed once every tile held has flushed it") {
+    const Path out = absolute(outRoot()) / "tiles-flush";
+    removeAll(out);
+    const std::string st = "TFLUSH";
+    const Path s = out / (st + ".zarr");
+    auto env = MultioTestEnvironment(zarrOnlyPlan(out));
+    auto fields = [&](std::int64_t id, std::int64_t step) {
+        const auto g = tileGeom(TT, id);
+        env.process(directTile(st, id, step, g.tw * g.th));
+        for (std::int64_t lev : {2, 1}) {
+            env.process(directTile(st, id, step, g.tw * g.th, [&](Metadata& m) {
+                m.set("levtype", std::string("S"));
+                m.set("levelist", lev);
+                m.set("is3d", true);
+            }));
+        }
+    };
+    auto flush = [&](std::int64_t id, std::int64_t step, const std::string& kind = "step") {
+        env.process(directTileFlush(st, id, step, kind));
+    };
+    auto lastStep = [&]() { return exists(s / ".last_step") ? readText(s / ".last_step") : std::string("none"); };
+    auto timeLength = [&]() {
+        return exists(s / "time" / "zarr.json")
+                 ? parseInts(multio::action::zarr::jsonMember(readText(s / "time" / "zarr.json"), "shape"))[0]
+                 : std::int64_t{-1};
+    };
+
+    // flushes of tiles of a store without any field: no store
+    flush(0, 0);
+    flush(7, 0, "end-of-simulation");
+    EXPECT(!exists(s));
+
+    // tiles 0 and 6 held: step 0 is closed by the second flush only
+    fields(0, 0);
+    fields(6, 0);
+    flush(0, 0);
+    EXPECT_EQUAL(lastStep(), std::string("none"));
+    EXPECT_EQUAL(timeLength(), -1);
+    EXPECT(exists(s / "S_TEMPERATURE" / ".staging_s0_L2_T6"));
+    flush(0, 0);  // repeated: nothing
+    flush(5, 0);  // a tile without fields on this rank: recorded only
+    EXPECT_EQUAL(lastStep(), std::string("none"));
+    flush(6, 0);
+    EXPECT_EQUAL(lastStep(), std::string("step=0 time_index=0 inc=0000:00:00\n"));
+    EXPECT_EQUAL(timeLength(), 1);
+    EXPECT(exists(s / "S_TEMPERATURE" / "c/0/1/1/1"));  // tile 6 = (jy, jx) = (1, 1), level 2 = index 1
+
+    // step 48: tile 0 flushes first
+    fields(0, 48);
+    flush(0, 48);
+    EXPECT_EQUAL(lastStep(), std::string("step=0 time_index=0 inc=0000:00:00\n"));
+    EXPECT_THROWS(fields(0, 48));  // tile 0 flushed step 48 already
+    fields(6, 48);
+    flush(6, 48);
+    EXPECT_EQUAL(lastStep(), std::string("step=48 time_index=1 inc=0001:00:00\n"));
+    EXPECT_EQUAL(timeLength(), 2);
+
+    // tile 13 shows up only now, with step 0: the step is reopened for its chunks; .last_step stays
+    fields(13, 0);
+    EXPECT(exists(s / "S_TEMPERATURE" / "c/0/0/2/3"));
+    flush(13, 0);
+    fields(13, 48);
+    flush(13, 48);
+    EXPECT_EQUAL(lastStep(), std::string("step=48 time_index=1 inc=0001:00:00\n"));
+    EXPECT_EQUAL(timeLength(), 2);
+    EXPECT(exists(s / "SURFTEMPERATURE" / "c/1/2/3"));
+    EXPECT_EQUAL(readFloats(s / "SURFTEMPERATURE" / "c/0/2/3")[0], 14.0f);
+
+    // an empty step: closed when every held tile flushed it; a field for it afterwards is an error
+    flush(0, 72);
+    flush(6, 72);
+    flush(13, 72);
+    EXPECT_THROWS(fields(0, 72));
+    EXPECT_EQUAL(timeLength(), 2);
+
+    // end-of-simulation: closed and finalised after the last held tile's
+    fields(13, 96);
+    fields(0, 96);
+    fields(6, 96);
+    flush(6, 96, "end-of-simulation");
+    flush(0, 96, "end-of-simulation");
+    EXPECT_EQUAL(lastStep(), std::string("step=48 time_index=1 inc=0001:00:00\n"));
+    // close-connection (domain global) does not finalise a store with an open step
+    {
+        Metadata md;
+        md.set("domain", std::string("global"));
+        md.set("flushKind", std::string("close-connection"));
+        env.process(Message{Message::Header{Message::Tag::Flush, SERVER, SERVER, std::move(md)}});
+    }
+    EXPECT_EQUAL(timeLength(), 2);
+    flush(13, 96, "end-of-simulation");
+    EXPECT_EQUAL(lastStep(), std::string("step=96 time_index=2 inc=0002:00:00\n"));
+    EXPECT_EQUAL(timeLength(), 3);
+    EXPECT(readText(s / "S_TEMPERATURE" / "zarr.json").find("\"shape\":[3,2,29,37]") != std::string::npos);
+    EXPECT_NO_THROW(flush(0, 96, "end-of-simulation"));  // repeated
+    EXPECT_EQUAL(countStaging(s), 0u);
+    EXPECT(!exists(out / "TNONE.zarr"));
+}
+
 }  // namespace multio::test::zarr
 
 int main(int argc, char** argv) {

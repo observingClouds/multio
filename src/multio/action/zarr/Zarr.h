@@ -50,6 +50,21 @@
 /// (comma-separated, outermost first, empty for a scalar), `zarr-dtype` (float64 or int32), `zarr-attributes`
 /// (JSON object) and optionally `zarr-group-attributes` (JSON object, replaces the root attributes). It is written
 /// as <name>/zarr.json plus one chunk with the whole array and replaces an array of the same name.
+///
+/// Spatial tiles: a message with `zarr-tile-size` T > 0 (int, real or string) belongs to one tile of the store
+/// `zarr-store` (its `domain` is `<store>#<tile>`, for the aggregate action and the transport only), `zarr-tile` is
+/// the tile id. The window nx x ny (geometry-nx/-ny) is cut into tiles of (Ty, Tx) = (min(T, ny), min(T, nx)),
+/// ntx = ceil(nx / Tx) by nty = ceil(ny / Ty), id = jy * ntx + jx (see ZarrStore.h for the store layout).
+///   - field: the tile only, tw * th values (this tile's size, edge tiles smaller), C order, x fastest,
+///     misc-globalSize = tw * th; no crop keys (the client crops). T, nx, ny must be the same on every message of a
+///     store.
+///   - static array: whole arrays as above, once per tile domain; repetitions are idempotent.
+///   - flush: per tile domain. The action keeps one ZarrStore per store, holding the tiles it receives (other
+///     tiles go to other server ranks, writing into the same directory); a step is closed once every tile held has
+///     flushed it, the store finalised once every tile held has sent end-of-simulation. A tile met only after a
+///     step was closed reopens that step for its own chunks (a tile's fields always come before its flush, but a
+///     tile can be unknown when another tile closes the first step).
+/// Without zarr-tile-size (or 0) nothing changes.
 
 #pragma once
 
@@ -79,7 +94,7 @@ private:
     void staticArray(const Message& msg);
     void flush(const Message& msg);
 
-    ZarrStore& store(const std::string& domain, const Message& msg);
+    ZarrStore& store(const std::string& domain, const Message& msg, std::int64_t tileSize);
     void finalizeAll() noexcept;
 
     std::string path_;

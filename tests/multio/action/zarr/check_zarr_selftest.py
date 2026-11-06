@@ -532,6 +532,126 @@ def check_quant_stores(root):
               f"(lossless zstd {du(os.path.join(root, f'zstd-load-{ln}-t3'))})")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Spatial tiles (TestZarr.cc "tiles: ..."): 37 x 29 window, tiles of 8 x 8 (5 x 4, edge tiles 5 wide / high)
+
+TNX, TNY, TT = 37, 29, 8
+T_FIELD_STEPS = [0, 48, 96]
+# name, id, axis, levels sent, first time index
+TVARS = [
+    ("S_TEMPERATURE", 1, "level_S", [3, 1, 2], 0),
+    ("KB_ISOT_ALTIT", 2, "level_K", [2, 1], 0),
+    ("KT_ISOT_ALTIT", 3, "level_K", [1], 0),
+    ("SURFTEMPERATURE", 4, None, [0], 0),
+    ("CLSTEMPERATURE", 5, None, [0], 0),
+    ("S_HUMI.SPECIFI", 6, "level_S", [1, 3], 1),
+]
+TAXES = {"level_S": [1, 2, 3], "level_K": [1, 2]}
+
+
+def tvalue_grid(vid, step, level):
+    y, x = np.mgrid[0:TNY, 0:TNX].astype(np.float64)
+    v = vid * 1000.0 + step * 10.0 + level * 0.5 + x * 0.01 + y * 0.37
+    if vid == 4:
+        v[(x + 3 * y) % 11 == 0] = np.nan
+    return v.astype(np.float32)
+
+
+def texpected(name):
+    _, vid, axis, levels, first = next(v for v in TVARS if v[0] == name)
+    if axis is None:
+        out = np.full((len(T_FIELD_STEPS), TNY, TNX), np.nan, dtype=np.float32)
+        for t, s in enumerate(T_FIELD_STEPS):
+            if t >= first:
+                out[t] = tvalue_grid(vid, s, 0)
+        return out
+    ax = TAXES[axis]
+    out = np.full((len(T_FIELD_STEPS), len(ax), TNY, TNX), np.nan, dtype=np.float32)
+    for t, s in enumerate(T_FIELD_STEPS):
+        if t >= first:
+            for lev in levels:
+                out[t, ax.index(lev)] = tvalue_grid(vid, s, lev)
+    return out
+
+
+def nan_equal(a, b):
+    a = np.asarray(a)
+    b = np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    both = np.isnan(a) & np.isnan(b) if a.dtype.kind == "f" else np.zeros(a.shape, bool)
+    return bool(np.all((a == b) | both))
+
+
+def check_tile_pair(ref, tiled, label, bitround):
+    gr = zarr.open_group(ref, mode="r")
+    gt = zarr.open_group(tiled, mode="r")
+    names_r = set(gr.array_keys())
+    names_t = set(gt.array_keys())
+    check(names_r == names_t, f"{label}: arrays {sorted(names_t)} != {sorted(names_r)}")
+    check(dict(gr.attrs) == dict(gt.attrs), f"{label}: root attributes")
+    for n in sorted(names_r & names_t):
+        a, b = gr[n], gt[n]
+        check(a.shape == b.shape and a.dtype == b.dtype, f"{label}: {n} shape/dtype {b.shape} {b.dtype}")
+        check(dict(a.attrs) == dict(b.attrs), f"{label}: {n} attributes")
+        check(a.metadata.dimension_names == b.metadata.dimension_names, f"{label}: {n} dimension names")
+        check(nan_equal(a[...], b[...]), f"{label}: {n} values differ")
+        if "time" in (a.metadata.dimension_names or ()) and n != "time":
+            tiles = (min(TT, TNY), min(TT, TNX))
+            if a.ndim == 4:
+                if a.shards is not None:
+                    check(b.shards == (1, a.shape[1]) + tiles and b.chunks == (1, 1) + tiles,
+                          f"{label}: {n} shards {b.shards} chunks {b.chunks}")
+                else:
+                    check(b.chunks == (1, 1) + tiles and b.shards is None, f"{label}: {n} chunks {b.chunks}")
+            else:
+                check(b.chunks == (1,) + tiles, f"{label}: {n} chunks {b.chunks}")
+            if n in dict((v[0], v) for v in TVARS):
+                want = texpected(n)
+                got = a[...]
+                if bitround:
+                    # 9 kept mantissa bits: relative error <= 2^-10
+                    ok = np.isnan(want) == np.isnan(got)
+                    fin = ~np.isnan(want)
+                    ok[fin] = np.abs(got[fin].astype(np.float64) - want[fin]) <= np.abs(want[fin]) * 2.0 ** -10
+                    check(bool(ok.all()), f"{label}: {n} bitround bound")
+                else:
+                    check(bit_equal(got, want), f"{label}: {n} values of the reference store")
+    # xarray reads the tiled store like the untiled one, consolidated or not
+    for consolidated in (True, False):
+        dr = xr.open_zarr(ref, consolidated=consolidated, zarr_format=3)
+        dt = xr.open_zarr(tiled, consolidated=consolidated, zarr_format=3)
+        for n in dr.data_vars:
+            check(nan_equal(dr[n].values, dt[n].values), f"{label} xr consolidated={consolidated}: {n}")
+        check(np.array_equal(dr.time.values, dt.time.values), f"{label} xr: time")
+
+
+def check_tile_stores(root):
+    found = 0
+    for layout in ("chunk-per-level", "shard-levels"):
+        for variant in ("raw", "zstd", "zstd-bitround"):
+            sub = f"{layout}-{variant}"
+            ref = os.path.join(root, f"tiles-ref-{sub}", "TILES.zarr")
+            if not os.path.exists(os.path.join(ref, "zarr.json")):
+                continue
+            for kind in ("tiles", "tiles-mw3"):
+                tiled = os.path.join(root, f"{kind}-{sub}", "TILES.zarr")
+                if kind == "tiles-mw3" and variant == "zstd-bitround":
+                    continue
+                check(os.path.exists(os.path.join(tiled, "zarr.json")), f"{kind}-{sub}: no store")
+                if os.path.exists(os.path.join(tiled, "zarr.json")):
+                    check_tile_pair(ref, tiled, f"{kind}-{sub}", variant == "zstd-bitround")
+                    found += 1
+    check(found >= 4, f"tiles: only {found} tiled stores")
+    print(f"tiles: {found} tiled stores read like their untiled references")
+    g = zarr.open_group(os.path.join(root, "tiles-flush", "TFLUSH.zarr"), mode="r")
+    check(g["S_TEMPERATURE"].shape == (3, 2, TNY, TNX), f"tiles-flush: shape {g['S_TEMPERATURE'].shape}")
+    s = g["SURFTEMPERATURE"][...]
+    check(np.all(s[:, 0:8, 0:8] == 1.0) and np.all(s[:, 16:24, 24:32] == 14.0) and np.all(s[:, 8:16, 8:16] == 7.0),
+          "tiles-flush: tile values")
+    check(np.isnan(s[:, 0:8, 8:16]).all(), "tiles-flush: tile without fields not NaN")
+
+
 def du(path):
     return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(path) for f in fs)
 
@@ -573,6 +693,7 @@ def main():
     check_static_stores(root)
     check_zstd_stores(root, {"chunk-per-level": stores["chunk-per-level"], "shard-levels": stores["shard-levels"]})
     check_quant_stores(root)
+    check_tile_stores(root)
 
     if failures:
         print(f"{len(failures)} FAILURES")

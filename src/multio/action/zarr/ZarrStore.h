@@ -17,6 +17,19 @@
 ///   float32, fill value NaN, bytes codec little endian, consolidated metadata in the root zarr.json.
 /// With compression the time-dependent arrays get a zstd codec after the bytes codec (shard-levels: inside the
 /// sharding codec, the shard index stays uncompressed); static arrays and coordinates stay uncompressed.
+///
+/// Spatial tiles (StoreSetup::tileSize T > 0): the nx x ny grid is cut into tiles of (Ty, Tx) = (min(T, ny),
+/// min(T, nx)) points, ntx = ceil(nx / Tx) by nty = ceil(ny / Ty), tile id = jy * ntx + jx. A tile is one chunk
+/// (chunk-per-level: chunk shape (1, 1, Ty, Tx) / (1, Ty, Tx), keys c/<t>/<k>/<jy>/<jx> / c/<t>/<jy>/<jx>) or one
+/// shard of all levels (shard-levels: shard (1, nlev, Ty, Tx), inner chunks (1, 1, Ty, Tx), key c/<t>/0/<jy>/<jx>).
+/// A field is given per tile (tw * th values of that tile, x fastest); edge tiles are padded with the fill value
+/// (NaN) to the full chunk shape. Staging, early shard writes and the encode jobs work per (variable, tile);
+/// range-bits quantization takes the range of the tile's values. Several ZarrStore objects (one per MultIO server
+/// rank) may write disjoint tiles of the same store: each writes the metadata from its own view (the consolidated
+/// nodes sorted by name, so that every writer produces the same bytes). A step is closed when every tile the
+/// object holds (has received a field or static array for) has flushed it; a tile that appears only after a step
+/// was closed (it was not known yet) reopens that step for its own chunks.
+/// T = 0: one tile covering the grid, behaviour and bytes as without tiles.
 
 #pragma once
 
@@ -27,6 +40,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -76,6 +90,7 @@ struct StoreSetup {
     Compression compression;     // chunk compression of the time-dependent arrays
     QuantRules quantize;         // lossy quantization before the compression, per array (needs compression)
     WorkerPool* pool = nullptr;  // compression workers (owned by the action); nullptr: compress inline
+    std::int64_t tileSize = 0;   // spatial tiles of tileSize x tileSize points; 0: untiled
 };
 
 class ZarrStore {
@@ -94,6 +109,10 @@ public:
     /// As above, taking over the values (no copy for the worker)
     void addField(const FieldDescription& fd, std::vector<float>&& values);
 
+    /// Tiled stores: add the tw * th values (C order, x fastest) of one tile of a field. The tile counts as held.
+    void addTile(const FieldDescription& fd, std::int64_t tile, const float* values, std::size_t n);
+    void addTile(const FieldDescription& fd, std::int64_t tile, std::vector<float>&& values);
+
     /// True if addField hands the values to worker threads (then the vector overload avoids a copy)
     bool encodesAsync() const { return compression_.enabled() && pool_ != nullptr; }
 
@@ -101,6 +120,17 @@ public:
     /// A step that has already been closed is not closed again; a step without any field creates no
     /// time step (it only counts as flushed).
     void flush(std::optional<std::int64_t> step, std::optional<double> leadTime);
+
+    /// Tiled stores: flush of one tile. The step is closed once every held tile has flushed it (without a step:
+    /// every open step, as flush). A tile that is not held is only recorded (a later field of it for a step it
+    /// flushed is an error). Returns the number of steps closed.
+    std::size_t flushTile(std::optional<std::int64_t> step, std::optional<double> leadTime, std::int64_t tile);
+
+    /// Tiled stores: end-of-simulation of one tile; true once every held tile has sent it (then finalise)
+    bool endOfSimulationTile(std::int64_t tile);
+
+    /// Tiled stores: a static array of this tile's domain arrived (the tile counts as held)
+    void holdTile(std::int64_t tile);
 
     /// Write (or replace) a static array and, if given, replace the root group attributes (compact JSON object;
     /// forecast_reference_time is then set to the store's reference time). The consolidated metadata is rewritten
@@ -120,6 +150,13 @@ public:
     std::int64_t ny() const { return ny_; }
     std::size_t numTimes() const { return times_.size(); }
     std::size_t numVariables() const { return vars_.size(); }
+
+    bool tiled() const { return tileSize_ > 0; }
+    std::int64_t tileSize() const { return tileSize_; }
+    std::int64_t numTiles() const { return ntx_ * nty_; }
+    std::int64_t tileWidth(std::int64_t tile) const;   // tw of a valid tile id
+    std::int64_t tileHeight(std::int64_t tile) const;  // th of a valid tile id
+    const std::set<std::int64_t>& heldTiles() const { return held_; }
 
 private:
     struct Axis {
@@ -159,19 +196,23 @@ private:
         std::string varDir;
         std::string varName;
         std::vector<std::int64_t> axisLevels;
+        std::int64_t tile = 0;
     };
+
+    using VarTile = std::pair<std::size_t, std::int64_t>;  // (variable index, tile id)
 
     struct OpenStep {
         std::int64_t step;
         std::size_t timeIndex;
         std::optional<double> leadTime;
-        // chunk-per-level, axis not yet frozen: (variable, level) -> staging file
-        std::map<std::pair<std::size_t, std::int64_t>, std::string> staged;
-        // shard-levels: variable -> level -> encoded inner chunk (raw or compressed bytes; filled by a worker
-        // until `jobs` is done)
-        std::unordered_map<std::size_t, LevelChunks> shards;
-        // shard-levels, early writes: variable -> state
-        std::unordered_map<std::size_t, std::shared_ptr<ShardState>> shardStates;
+        bool reopened = false;  // tiled: the step had been closed before a tile not known then sent fields for it
+        // chunk-per-level, axis not yet frozen: (variable, level, tile) -> staging file
+        std::map<std::tuple<std::size_t, std::int64_t, std::int64_t>, std::string> staged;
+        // shard-levels: (variable, tile) -> level -> encoded inner chunk (raw or compressed bytes; filled by a
+        // worker until `jobs` is done)
+        std::map<VarTile, LevelChunks> shards;
+        // shard-levels, early writes: (variable, tile) -> state
+        std::map<VarTile, std::shared_ptr<ShardState>> shardStates;
         // compression jobs of this step (closing the step waits for them)
         std::shared_ptr<JobGroup> jobs;
     };
@@ -193,7 +234,7 @@ private:
 
     std::size_t variableIndex(const FieldDescription& fd);
     int axisIndex(char letter);
-    OpenStep& openStep(std::int64_t step);
+    OpenStep& openStep(std::int64_t step, std::int64_t tile);
     void closeStep(OpenStep& st, std::optional<double> leadTime);
 
     std::string arrayJson(const Variable& v) const;
@@ -202,15 +243,19 @@ private:
     std::string rootJson() const;
 
     std::string varPath(const Variable& v) const { return root_ + "/" + v.name; }
-    std::string chunkPath(const Variable& v, std::size_t t, std::int64_t k) const;
+    std::string chunkPath(const Variable& v, std::size_t t, std::int64_t k, std::int64_t tile) const;
+    std::string tileKey(std::int64_t tile) const;  // "<jy>/<jx>"
+    void checkTile(std::int64_t tile, const FieldDescription& fd, std::size_t n) const;
+    bool allHeldFlushed(std::int64_t step) const;
 
-    void addFieldImpl(const FieldDescription& fd, const float* values, std::size_t n,
-                      const std::shared_ptr<std::vector<float>>& owned);
+    void addFieldImpl(const FieldDescription& fd, std::int64_t tile, const float* values, std::size_t n,
+                      std::shared_ptr<std::vector<float>> owned);
     void writeChunk(const std::string& path, const void* data, std::size_t nbytes) const;
     void encodeChunk(const std::string& path, bool ensureDir, const float* values, std::size_t nbytes) const;
-    void writeShard(const Variable& v, std::size_t t, const LevelChunks& levels);
+    void writeShard(const Variable& v, std::size_t t, std::int64_t tile, const LevelChunks& levels);
     void writeShardFile(const std::string& varDir, const std::string& varName,
-                        const std::vector<std::int64_t>& axisLevels, std::size_t t, const LevelChunks& levels) const;
+                        const std::vector<std::int64_t>& axisLevels, std::size_t t, std::int64_t tile,
+                        const LevelChunks& levels) const;
     void writeEarlyShard(ShardState& ss, std::size_t t) const;  // any thread
     void writeArrayMeta(const Variable& v);
     void ensureQuantizationContainer(const Quantization& q);
@@ -245,6 +290,18 @@ private:
     std::map<std::size_t, OpenStep> open_;           // time index -> open step
     std::set<std::int64_t> closed_;
     std::int64_t lastStep_ = 0;
+    std::optional<std::size_t> lastTimeIndex_;  // largest time index closed so far (.last_step never goes back)
+
+    // Spatial tiles (untiled: one tile of nx x ny)
+    std::int64_t tileSize_ = 0;
+    std::int64_t tileX_ = 0;  // Tx
+    std::int64_t tileY_ = 0;  // Ty
+    std::int64_t ntx_ = 1;
+    std::int64_t nty_ = 1;
+    std::set<std::int64_t> held_;                                    // tiles with a field or static array
+    std::map<std::int64_t, std::set<std::int64_t>> flushedTiles_;   // step -> tiles that flushed it
+    std::set<std::int64_t> eosTiles_;                                // tiles that sent end-of-simulation
+    std::unordered_map<std::string, std::size_t> staticHash_;       // tiled: hash of the last static array per name
 
     bool finalized_ = false;
     Compression compression_;
