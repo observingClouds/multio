@@ -570,7 +570,7 @@ std::string ZarrStore::chunkPath(const Variable& v, std::size_t t, std::int64_t 
     return p;
 }
 
-void ZarrStore::writeChunk(const std::string& path, const void* data, std::size_t nbytes) {
+void ZarrStore::writeChunk(const std::string& path, const void* data, std::size_t nbytes) const {
     dirs_.ensure(dirName(path));
     writeFileAtomic(path, data, nbytes);
 }
@@ -662,9 +662,22 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
     }
 
     if (layout_ == Layout::ShardLevels) {
-        // inner chunk kept until the flush, compressed on arrival (a replaced slot stays alive for its job)
-        auto slot = std::make_shared<std::vector<unsigned char>>();
+        // Inner chunk, encoded on arrival. Once the variable has every level of its frozen axis the shard is
+        // written right away; otherwise (first step, fewer levels than the axis) at the flush.
+        auto& ss = st.shardStates[vi];
+        if (!ss) {
+            ss = std::make_shared<ShardState>();
+        }
+        if (ss->scheduled) {
+            eckit::Log::warning() << "zarr action: " << name_ << ": " << v.name << " level " << fd.level
+                                  << " of step " << fd.step
+                                  << " arrived again after the shard was complete; the repeated field is ignored"
+                                  << std::endl;
+            return;
+        }
+        auto slot = std::make_shared<std::vector<unsigned char>>();  // a replaced slot stays alive for its job
         st.shards[vi][fd.level] = slot;
+        const std::size_t t = st.timeIndex;
         if (!compression_.enabled()) {
             const auto* b = reinterpret_cast<const unsigned char*>(values);
             slot->assign(b, b + nbytes);
@@ -673,9 +686,23 @@ void ZarrStore::addFieldImpl(const FieldDescription& fd, const float* values, st
             *slot = compressExact(compression_, quantizedValues(q, values, n, nullptr), nbytes);
         }
         else {
-            pool_->submit(st.jobs, [this, slot, owned, nbytes, n, q] {
+            ss->pending.fetch_add(1, std::memory_order_relaxed);
+            pool_->submit(st.jobs, [this, slot, owned, nbytes, n, q, ss, t] {
                 *slot = compressExact(compression_, quantizedValues(q, owned->data(), n, owned.get()), nbytes);
+                if (ss->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    writeEarlyShard(*ss, t);
+                }
             });
+        }
+        if (a.frozen && st.shards[vi].size() == a.levels.size()) {
+            ss->scheduled = true;
+            ss->snapshot = st.shards[vi];
+            ss->varDir = varPath(v);
+            ss->varName = v.name;
+            ss->axisLevels = a.levels;
+            if (ss->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                writeEarlyShard(*ss, t);  // every chunk already encoded: write here
+            }
         }
         return;
     }
@@ -754,8 +781,18 @@ void ZarrStore::closeStep(OpenStep& st, std::optional<double> leadTime) {
         dirs_.ensure(dirName(dst));
         renamePath(s.second, dst);
     }
+    std::size_t early = 0;
     for (const auto& sh : st.shards) {
+        auto ssIt = st.shardStates.find(sh.first);
+        if (ssIt != st.shardStates.end() && ssIt->second->written.load(std::memory_order_acquire)) {
+            ++early;
+            continue;
+        }
         writeShard(vars_[sh.first], t, sh.second);
+    }
+    if (!st.shards.empty()) {
+        LOG_DEBUG_LIB(LibMultio) << "zarr action: " << name_ << ": step " << step << ": " << early << " of "
+                                 << st.shards.size() << " shards written before the flush" << std::endl;
     }
 
     // 3. Time coordinate value
@@ -943,21 +980,36 @@ std::string ZarrStore::rootJson() const {
 
 //----------------------------------------------------------------------------------------------------------------------
 
-void ZarrStore::writeShard(const Variable& v, std::size_t t,
-                           const std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>& levels) {
-    const Axis& a = axes_[v.axis];
-    const std::size_t nlev = a.levels.size();
+void ZarrStore::writeShard(const Variable& v, std::size_t t, const LevelChunks& levels) {
+    writeShardFile(varPath(v), v.name, axes_[v.axis].levels, t, levels);
+}
+
+/// Write a shard from a worker (or inline) as soon as its levels are complete, then free its chunks: they are
+/// not needed again, a repeated field for a complete shard is ignored
+void ZarrStore::writeEarlyShard(ShardState& ss, std::size_t t) const {
+    writeShardFile(ss.varDir, ss.varName, ss.axisLevels, t, ss.snapshot);
+    for (auto& l : ss.snapshot) {
+        std::vector<unsigned char>().swap(*l.second);
+    }
+    ss.written.store(true, std::memory_order_release);
+}
+
+/// Touches no member that the receiving thread changes (vars_, axes_): safe from a worker thread
+void ZarrStore::writeShardFile(const std::string& varDir, const std::string& varName,
+                               const std::vector<std::int64_t>& axisLevels, std::size_t t,
+                               const LevelChunks& levels) const {
+    const std::size_t nlev = axisLevels.size();
     const std::size_t chunkBytes = static_cast<std::size_t>(nx_ * ny_) * sizeof(float);
 
     std::size_t total = 0;
     for (const auto& l : levels) {
-        if (a.index.find(l.first) == a.index.end()) {
+        if (!std::binary_search(axisLevels.begin(), axisLevels.end(), l.first)) {
             std::ostringstream oss;
-            oss << "zarr action: level " << l.first << " of " << v.name << " not on axis " << a.dim;
+            oss << "zarr action: level " << l.first << " of " << varName << " not on its level axis";
             throw eckit::SeriousBug(oss.str(), Here());
         }
         if (!compression_.enabled() && l.second->size() != chunkBytes) {
-            throw eckit::SeriousBug("zarr action: inner chunk of " + v.name + " has the wrong size", Here());
+            throw eckit::SeriousBug("zarr action: inner chunk of " + varName + " has the wrong size", Here());
         }
         total += l.second->size();
     }
@@ -968,7 +1020,7 @@ void ZarrStore::writeShard(const Variable& v, std::size_t t,
     std::vector<std::uint64_t> index(2 * nlev, std::numeric_limits<std::uint64_t>::max());
     std::size_t off = 0;
     for (std::size_t k = 0; k < nlev; ++k) {
-        auto it = levels.find(a.levels[k]);
+        auto it = levels.find(axisLevels[k]);
         if (it == levels.end()) {
             continue;
         }
@@ -982,7 +1034,7 @@ void ZarrStore::writeShard(const Variable& v, std::size_t t,
     }
     std::memcpy(buf.data() + off, index.data(), index.size() * sizeof(std::uint64_t));
 
-    std::string path = varPath(v) + "/c/" + std::to_string(t) + "/0/0/0";
+    std::string path = varDir + "/c/" + std::to_string(t) + "/0/0/0";
     writeChunk(path, buf.data(), buf.size());
 }
 

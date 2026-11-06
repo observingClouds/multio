@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -141,6 +142,25 @@ private:
         bool published = false;  // array metadata written, part of the consolidated metadata
     };
 
+    using LevelChunks = std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>;
+
+    /// shard-levels: a variable's shard of one step is written as soon as it has every level of its (frozen)
+    /// level axis and its inner chunks are encoded, by the job that finishes last (or inline without workers),
+    /// not at the flush. A frozen axis takes no new level, so such a shard is complete. Shards of the first step
+    /// (axes not frozen yet) and of variables with fewer levels than their axis are written at the flush.
+    /// `pending` counts the outstanding encode jobs plus one token held until all levels have arrived; whoever
+    /// brings it to 0 writes the shard. The writer only uses what is copied here (vars_ and axes_ may grow
+    /// meanwhile).
+    struct ShardState {
+        std::atomic<int> pending{1};
+        bool scheduled = false;          // all levels arrived, token dropped (main thread only)
+        std::atomic<bool> written{false};
+        LevelChunks snapshot;            // the level chunks, taken when the token is dropped
+        std::string varDir;
+        std::string varName;
+        std::vector<std::int64_t> axisLevels;
+    };
+
     struct OpenStep {
         std::int64_t step;
         std::size_t timeIndex;
@@ -149,8 +169,9 @@ private:
         std::map<std::pair<std::size_t, std::int64_t>, std::string> staged;
         // shard-levels: variable -> level -> encoded inner chunk (raw or compressed bytes; filled by a worker
         // until `jobs` is done)
-        std::unordered_map<std::size_t, std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>>
-            shards;
+        std::unordered_map<std::size_t, LevelChunks> shards;
+        // shard-levels, early writes: variable -> state
+        std::unordered_map<std::size_t, std::shared_ptr<ShardState>> shardStates;
         // compression jobs of this step (closing the step waits for them)
         std::shared_ptr<JobGroup> jobs;
     };
@@ -185,10 +206,12 @@ private:
 
     void addFieldImpl(const FieldDescription& fd, const float* values, std::size_t n,
                       const std::shared_ptr<std::vector<float>>& owned);
-    void writeChunk(const std::string& path, const void* data, std::size_t nbytes);
+    void writeChunk(const std::string& path, const void* data, std::size_t nbytes) const;
     void encodeChunk(const std::string& path, bool ensureDir, const float* values, std::size_t nbytes) const;
-    void writeShard(const Variable& v, std::size_t t,
-                    const std::map<std::int64_t, std::shared_ptr<std::vector<unsigned char>>>& levels);
+    void writeShard(const Variable& v, std::size_t t, const LevelChunks& levels);
+    void writeShardFile(const std::string& varDir, const std::string& varName,
+                        const std::vector<std::int64_t>& axisLevels, std::size_t t, const LevelChunks& levels) const;
+    void writeEarlyShard(ShardState& ss, std::size_t t) const;  // any thread
     void writeArrayMeta(const Variable& v);
     void ensureQuantizationContainer(const Quantization& q);
     void writeTime(std::size_t t);

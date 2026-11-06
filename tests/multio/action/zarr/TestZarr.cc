@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <functional>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -29,6 +31,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <dirent.h>
@@ -1621,6 +1624,113 @@ CASE("zstd compression: worker pool under load, ZarrStore directly") {
 
 /// A failing compression job (here: its chunk directory cannot be created) is reported by the flush of its
 /// step, not lost; the other steps are not affected
+CASE("shard-levels: complete shards are written before the flush") {
+    namespace z = multio::action::zarr;
+    const std::int64_t nx = 37;
+    const std::int64_t ny = 29;
+    const std::int64_t nlev = 8;
+    auto field = [&](int var, std::int64_t step, std::int64_t lev) {
+        std::vector<float> v(static_cast<std::size_t>(nx * ny));
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            v[i] = static_cast<float>(100.0 * var + step + 0.01 * lev + 1e-4 * static_cast<double>(i));
+        }
+        return v;
+    };
+    // Variable S_FULL has every level of the axis; S_PART misses the top level from step 1 on, so its shards wait
+    // for the flush. A repeated field for a complete shard is ignored.
+    auto shard = [](const Path& store, const std::string& var, std::int64_t t) {
+        return store / var / "c" / std::to_string(t) / "0" / "0" / "0";
+    };
+    auto waitFor = [](const Path& p) {
+        for (int i = 0; i < 1000 && !exists(p); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return exists(p);
+    };
+    struct Variant {
+        std::string name;
+        bool zstd;
+        int threads;
+    };
+    std::vector<Variant> variants{{"raw", false, 0}, {"zstd-inline", true, 0}, {"zstd-t3", true, 3}};
+    std::vector<Path> stores;
+    for (const auto& var : variants) {
+        if (var.zstd && !z::zstdAvailable()) {
+            continue;
+        }
+        const Path dir = absolute(outRoot()) / ("early-shards-" + var.name);
+        removeAll(dir);
+        std::unique_ptr<z::WorkerPool> pool;
+        if (var.threads > 0) {
+            pool = std::make_unique<z::WorkerPool>(var.threads, 4);
+        }
+        z::StoreSetup setup;
+        setup.name = "EARLY";
+        setup.dir = dir.string();
+        setup.layout = z::Layout::ShardLevels;
+        setup.nx = nx;
+        setup.ny = ny;
+        setup.forecastReferenceTime = FRT;
+        if (var.zstd) {
+            setup.compression = z::Compression{z::Codec::Zstd, 3};
+        }
+        setup.pool = pool.get();
+        const Path store = dir / "EARLY.zarr";
+        {
+            z::ZarrStore st(setup);
+            for (std::int64_t step = 0; step < 3; ++step) {
+                z::FieldDescription fd;
+                fd.prefix = "S";
+                fd.is3d = true;
+                fd.step = step;
+                fd.leadTime = 3600.0 * step;
+                for (int v = 0; v < 2; ++v) {
+                    fd.suffix = v == 0 ? "FULL" : "PART";
+                    const std::int64_t top = (v == 1 && step > 0) ? nlev - 1 : nlev;
+                    for (std::int64_t lev = 1; lev <= top; ++lev) {
+                        fd.level = lev;
+                        st.addField(fd, field(v, step, lev));
+                    }
+                }
+                if (step == 0) {
+                    // level axis not known yet: nothing before the flush
+                    EXPECT(!exists(shard(store, "S_FULL", 0)));
+                }
+                else {
+                    EXPECT(waitFor(shard(store, "S_FULL", step)));
+                    EXPECT(!exists(shard(store, "S_PART", step)));
+                    if (step == 2) {
+                        fd.suffix = "FULL";
+                        fd.level = 3;
+                        st.addField(fd, field(7, step, 3));  // repeated after completion: ignored
+                    }
+                }
+                st.flush(step, std::nullopt);
+                EXPECT(exists(shard(store, "S_FULL", step)));
+                EXPECT(exists(shard(store, "S_PART", step)));
+            }
+            st.finalize();
+        }
+        stores.push_back(store);
+    }
+    // same bytes with the encoding inline or on workers
+    if (stores.size() == 3) {
+        EXPECT(sameTree(stores[1], stores[2]));
+    }
+    // the shard of step 2 holds the first S_FULL level 3, not the repeated one: compare with step 1's layout
+    // through the raw store (uncompressed inner chunks at fixed offsets)
+    {
+        const Path p = shard(stores[0], "S_FULL", 2);
+        std::ifstream in(p.string(), std::ios::binary);
+        std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::size_t chunk = static_cast<std::size_t>(nx * ny) * sizeof(float);
+        EXPECT_EQUAL(bytes.size(), static_cast<std::size_t>(nlev) * chunk + static_cast<std::size_t>(nlev) * 16);
+        float first;
+        std::memcpy(&first, bytes.data() + 2 * chunk, sizeof(float));  // level 3 = index 2
+        EXPECT_EQUAL(first, field(0, 2, 3)[0]);
+    }
+}
+
 CASE("zstd compression: an error in a worker is rethrown by the flush") {
     if (!multio::action::zarr::zstdAvailable()) {
         std::cout << "built without zstd, skipped" << std::endl;
